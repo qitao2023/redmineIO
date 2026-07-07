@@ -1,0 +1,8 @@
+dist/
+build/
+__pycache__/
+*.pyc
+*.egg-info/
+reports/
+icon_preview.png
+config.yaml
