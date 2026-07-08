@@ -6,3 +6,4 @@ __pycache__/
 reports/
 icon_preview.png
 config.yaml
+build_time.py

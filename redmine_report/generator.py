@@ -4,9 +4,14 @@
 未匹配的归入「其他」第 4 节。
 """
 
+import textwrap
 from datetime import datetime
 
 from .models import DailyReport, IssueEntryData
+
+# 文本自动换行配置
+_LINE_WIDTH = 80
+_CONTINUATION_INDENT = "       "  # 续行缩进，对齐"1、"后的第一个汉字
 
 # Tracker 分组规则：按 Redmine「跟踪」字段匹配
 TRACKER_GROUP_RULES: list[tuple[str, list[str]]] = [
@@ -45,14 +50,24 @@ def _priority_key(e: IssueEntryData) -> int:
 
 
 def _format_entry(idx: int, e: IssueEntryData) -> str:
-    """格式化单条 Issue 为日报行。"""
+    """格式化单条 Issue 为日报行，长行自动换行并缩进。"""
     time_str = e.time_str or "  :  "
     priority = f"[{e.priority_name}]" if e.priority_name else ""
     project = e.project_name or ""
     tracker = e.tracker_name or ""
     status = f"({e.status_name})" if e.status_name else ""
     subject = e.issue_subject or ""
-    return f"   {idx}) {priority} {time_str} {project} {tracker} #{e.issue_id} {status}: {subject}"
+    line = f"   {idx}) {priority} {time_str} {project} {tracker} #{e.issue_id} {status}: {subject}"
+
+    if len(line) <= _LINE_WIDTH:
+        return line
+
+    wrapper = textwrap.TextWrapper(
+        width=_LINE_WIDTH,
+        subsequent_indent=_CONTINUATION_INDENT,
+        break_long_words=False,
+    )
+    return wrapper.fill(line)
 
 
 def _classify_tracker(tracker_name: str) -> str:
@@ -68,7 +83,7 @@ def _classify_tracker(tracker_name: str) -> str:
     return "其他"
 
 
-def generate_report(report: DailyReport, custom_other: str = "") -> str:
+def generate_report(report: DailyReport, custom_other: str = "", end_time: str | None = None) -> str:
     """生成纯文本日报。
 
     Args:
@@ -134,8 +149,9 @@ def generate_report(report: DailyReport, custom_other: str = "") -> str:
     # 底部
     lines.append("=========")
     lines.append("考勤记录：")
-    now = datetime.now().strftime("%H:%M")
-    lines.append(f"上班时间：08:30；下班时间：{now}")
+    if end_time is None:
+        end_time = datetime.now().strftime("%H:%M")
+    lines.append(f"上班时间：08:30；下班时间：{end_time}")
     lines.append("中途外出记录：无；")
 
     return "\n".join(lines) + "\n"

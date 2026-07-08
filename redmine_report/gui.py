@@ -6,12 +6,17 @@
 import os
 import sys
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+import win32clipboard
 
+try:
+    from .build_time import BUILD_TIME
+except ImportError:
+    BUILD_TIME = ""
 from .config import ConfigError, load_config
 from .client import RedmineClient, RedmineClientError
 from .generator import generate_report
@@ -35,7 +40,8 @@ class RedmineReportApp(ctk.CTk):
         super().__init__()
 
         # 窗口设置
-        self.title(APP_TITLE)
+        build_tag = f"  [{BUILD_TIME}]" if BUILD_TIME else ""
+        self.title(APP_TITLE + build_tag)
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(900, 550)
 
@@ -125,6 +131,7 @@ class RedmineReportApp(ctk.CTk):
         key_frame.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
         key_frame.grid_columnconfigure(0, weight=1)
         key_frame.grid_columnconfigure(1, weight=0)
+        key_frame.grid_columnconfigure(2, weight=0)
 
         self.key_entry = ctk.CTkEntry(
             key_frame,
@@ -142,7 +149,16 @@ class RedmineReportApp(ctk.CTk):
             height=34,
             command=self._toggle_key_visibility,
         )
-        self.eye_btn.grid(row=0, column=1)
+        self.eye_btn.grid(row=0, column=1, padx=(0, 2))
+
+        self.save_key_btn = ctk.CTkButton(
+            key_frame,
+            text="💾",
+            width=36,
+            height=34,
+            command=self._save_config,
+        )
+        self.save_key_btn.grid(row=0, column=2)
         row += 1
 
         # ── 报告日期 ──
@@ -172,7 +188,65 @@ class RedmineReportApp(ctk.CTk):
             height=34,
             command=self._set_today,
         )
-        self.today_btn.grid(row=0, column=1)
+        self.today_btn.grid(row=0, column=1, padx=(0, 2))
+
+        self.yesterday_btn = ctk.CTkButton(
+            date_frame,
+            text="昨天",
+            width=50,
+            height=34,
+            command=self._set_yesterday,
+        )
+        self.yesterday_btn.grid(row=0, column=2)
+        row += 1
+
+        # ── 下班时间 ──
+        ctk.CTkLabel(frame, text="下班时间", anchor="w").grid(
+            row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="w"
+        )
+        row += 1
+
+        time_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        time_frame.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
+        time_frame.grid_columnconfigure(0, weight=1)
+        time_frame.grid_columnconfigure(1, weight=0)
+
+        now_str = datetime.now().strftime("%H:%M")
+        self.time_entry = ctk.CTkEntry(
+            time_frame,
+            placeholder_text="HH:MM",
+            height=34,
+            width=80,
+        )
+        self.time_entry.insert(0, now_str)
+        self.time_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.now_btn = ctk.CTkButton(
+            time_frame,
+            text="现在",
+            width=50,
+            height=34,
+            command=self._set_time_now,
+        )
+        self.now_btn.grid(row=0, column=1, padx=(0, 2))
+
+        self.time_1730_btn = ctk.CTkButton(
+            time_frame,
+            text="17:30",
+            width=50,
+            height=34,
+            command=lambda: self._set_time("17:30"),
+        )
+        self.time_1730_btn.grid(row=0, column=2, padx=(0, 2))
+
+        self.time_2030_btn = ctk.CTkButton(
+            time_frame,
+            text="20:30",
+            width=50,
+            height=34,
+            command=lambda: self._set_time("20:30"),
+        )
+        self.time_2030_btn.grid(row=0, column=3)
         row += 1
 
         # ── 分隔线 ──
@@ -181,7 +255,7 @@ class RedmineReportApp(ctk.CTk):
         )
         row += 1
 
-        # ── 测试连接 + 加载配置 ──
+        # ── 测试连接 + 数据诊断 ──
         btn_row = ctk.CTkFrame(frame, fg_color="transparent")
         btn_row.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
         btn_row.grid_columnconfigure(0, weight=1)
@@ -197,18 +271,28 @@ class RedmineReportApp(ctk.CTk):
         )
         self.test_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
-        self.save_cfg_btn = ctk.CTkButton(
+        self.diag_btn = ctk.CTkButton(
             btn_row,
-            text="💾 保存Key",
-            command=self._save_config,
+            text="🔬 数据诊断",
+            command=self._diagnose_data,
             height=34,
+            fg_color="transparent",
+            border_width=1,
+            border_color=("gray50", "gray40"),
+            text_color=("gray50", "gray60"),
+            font=ctk.CTkFont(size=11),
         )
-        self.save_cfg_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        self.diag_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
         row += 1
 
-        # ── 生成按钮 ──
+        # ── 生成 + 复制 ──
+        gen_row = ctk.CTkFrame(frame, fg_color="transparent")
+        gen_row.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew")
+        gen_row.grid_columnconfigure(0, weight=2)
+        gen_row.grid_columnconfigure(1, weight=1)
+
         self.generate_btn = ctk.CTkButton(
-            frame,
+            gen_row,
             text="🚀 生成日报",
             command=self._generate_report,
             height=40,
@@ -216,33 +300,16 @@ class RedmineReportApp(ctk.CTk):
             hover_color="#1d4ed8",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.generate_btn.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew")
-        row += 1
+        self.generate_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
-        # ── 保存按钮 ──
         self.copy_btn = ctk.CTkButton(
-            frame,
-            text="📋 复制日报",
+            gen_row,
+            text="📋 复制",
             command=self._copy_report,
-            height=34,
+            height=40,
             state="disabled",
         )
-        self.copy_btn.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
-        row += 1
-
-        # ── 数据诊断按钮 ──
-        self.diag_btn = ctk.CTkButton(
-            frame,
-            text="🔬 数据诊断",
-            command=self._diagnose_data,
-            height=30,
-            fg_color="transparent",
-            border_width=1,
-            border_color=("gray50", "gray40"),
-            text_color=("gray50", "gray60"),
-            font=ctk.CTkFont(size=11),
-        )
-        self.diag_btn.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y // 2), sticky="ew")
+        self.copy_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
         row += 1
 
         # ── 其他补充输入 ──
@@ -275,22 +342,24 @@ class RedmineReportApp(ctk.CTk):
         frame.grid_rowconfigure(0, weight=0)
         frame.grid_rowconfigure(1, weight=1)
 
-        # 标题
-        ctk.CTkLabel(
+        # 标题（动态更新）
+        self.preview_title = ctk.CTkLabel(
             frame,
             text="📋 日报预览",
             font=ctk.CTkFont(size=16, weight="bold"),
             anchor="w",
-        ).grid(row=0, column=0, padx=PAD_X, pady=(PAD_Y, 4), sticky="w")
+        )
+        self.preview_title.grid(row=0, column=0, padx=PAD_X, pady=(PAD_Y, 4), sticky="w")
 
         # 文本区域
         self.preview_text = ctk.CTkTextbox(
             frame,
             wrap="none",
-            font=ctk.CTkFont(family="Microsoft YaHei", size=13),
+            font=ctk.CTkFont(family="Consolas", size=12),
             activate_scrollbars=True,
         )
         self.preview_text.grid(row=1, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="nsew")
+        self.preview_text._textbox.configure(spacing1=3, spacing2=1, spacing3=3)
 
         # 手动添加水平滚动条
         self.h_scroll = ctk.CTkScrollbar(frame, orientation="horizontal",
@@ -349,6 +418,22 @@ class RedmineReportApp(ctk.CTk):
         """日期设为今天。"""
         self.date_entry.delete(0, "end")
         self.date_entry.insert(0, date.today().isoformat())
+
+    def _set_yesterday(self):
+        """日期设为昨天。"""
+        self.date_entry.delete(0, "end")
+        yesterday = date.today() - timedelta(days=1)
+        self.date_entry.insert(0, yesterday.isoformat())
+
+    def _set_time_now(self):
+        """下班时间设为当前时间。"""
+        self.time_entry.delete(0, "end")
+        self.time_entry.insert(0, datetime.now().strftime("%H:%M"))
+
+    def _set_time(self, time_str: str):
+        """下班时间设为指定值。"""
+        self.time_entry.delete(0, "end")
+        self.time_entry.insert(0, time_str)
 
     def _validate_date(self, date_str: str) -> bool:
         """验证日期格式 YYYY-MM-DD。"""
@@ -486,6 +571,7 @@ class RedmineReportApp(ctk.CTk):
         self.test_btn.configure(state="normal", text="🔍 测试连接")
         self._show_progress(False)
         self._set_status("连接测试通过 ✓ — Key 已保存")
+        self._set_preview_title("🔍 连接测试")
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
         self.preview_text.insert(
@@ -496,12 +582,12 @@ class RedmineReportApp(ctk.CTk):
             f"> Key 已自动保存到 config.yaml，下次打开无需重新输入。"
         )
         self.preview_text.configure(state="disabled")
-        messagebox.showinfo("连接成功", msg)
 
     def _on_test_error(self, msg: str):
         self.test_btn.configure(state="normal", text="🔍 测试连接")
         self._show_progress(False)
         self._set_status("连接测试失败 ✗")
+        self._set_preview_title("🔍 连接测试")
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
         self.preview_text.insert(
@@ -514,7 +600,6 @@ class RedmineReportApp(ctk.CTk):
             f"4. **SSL/证书问题** — 内网可能使用自签名证书\n"
         )
         self.preview_text.configure(state="disabled")
-        messagebox.showerror("连接失败", msg)
 
     def _generate_report(self):
         """后台线程生成日报。"""
@@ -569,7 +654,7 @@ class RedmineReportApp(ctk.CTk):
 
             # 生成 Markdown
             self._after_status("正在生成日报...")
-            content = generate_report(report, custom_other=custom_other)
+            content = generate_report(report, custom_other=custom_other, end_time=self.time_entry.get().strip())
             self._report_date = report_date
 
         except RedmineClientError as e:
@@ -586,6 +671,7 @@ class RedmineReportApp(ctk.CTk):
     def _on_generate_success(self, report, content: str):
         """生成成功：更新预览。"""
         self._report_content = content
+        self._set_preview_title("📋 日报预览")
 
         # 更新预览区 + 分节着色
         self.preview_text.configure(state="normal")
@@ -654,13 +740,106 @@ class RedmineReportApp(ctk.CTk):
         messagebox.showerror("生成失败", error_msg)
 
     def _copy_report(self):
-        """复制日报到剪贴板。"""
+        """复制日报到剪贴板（带颜色格式）。"""
         if not self._report_content:
             return
-        self.clipboard_clear()
-        self.clipboard_append(self._report_content)
-        self._set_status("日报已复制到剪贴板 ✓")
-        messagebox.showinfo("已复制", "日报内容已复制到剪贴板，可直接粘贴。")
+        html = self._report_to_html(self._report_content)
+        try:
+            self._write_clipboard_html(self._report_content, html)
+            self._set_status("日报已复制到剪贴板 ✓（带格式）")
+        except Exception:
+            # 回退到纯文本
+            self.clipboard_clear()
+            self.clipboard_append(self._report_content)
+            self._set_status("日报已复制到剪贴板 ✓")
+
+    @staticmethod
+    def _report_to_html(content: str) -> str:
+        """将纯文本日报转为带颜色的 HTML。"""
+        SECTION_COLORS = {
+            "1、": "#3b82f6",  # 蓝 — 技术支持
+            "2、": "#10b981",  # 绿 — 功能
+            "3、": "#ef4444",  # 红 — BUG
+            "4、": "#c026d3",  # 洋红 — 其他
+        }
+        lines = content.split("\n")
+        html_lines = []
+        current_color: str | None = None
+
+        for line in lines:
+            escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            color = None
+            for prefix, c in SECTION_COLORS.items():
+                if escaped.startswith(prefix):
+                    color = c
+                    current_color = c
+                    break
+
+            if color is None and escaped.strip() and current_color:
+                color = current_color  # 条目沿用节的颜色
+
+            if color:
+                html_lines.append(f'<span style="color:{color}">{escaped}</span>')
+            else:
+                html_lines.append(escaped)
+
+        body = "\n".join(html_lines)
+        return (
+            f'<pre style="font-family:Consolas,monospace;font-size:12pt;'
+            f'line-height:1.6;margin:0">{body}</pre>'
+        )
+
+    @staticmethod
+    def _write_clipboard_html(plain_text: str, html: str):
+        """使用 Windows Clipboard API 同时写入 HTML 和纯文本。"""
+        # 构建 HTML Format 格式（Windows 剪贴板标准）
+        pre = (
+            "Version:0.9\r\n"
+            "StartHTML:0000000000\r\n"
+            "EndHTML:0000000000\r\n"
+            "StartFragment:0000000000\r\n"
+            "EndFragment:0000000000\r\n"
+        )
+        html_doc = (
+            "<html><body>\r\n"
+            "<!--StartFragment-->\r\n"
+            f"{html}\r\n"
+            "<!--EndFragment-->\r\n"
+            "</body></html>"
+        )
+
+        pre_b = pre.encode("utf-8")
+        html_b = html.encode("utf-8")
+        doc_b = html_doc.encode("utf-8")
+        frag_start_b = b"<html><body>\r\n<!--StartFragment-->\r\n"
+
+        start_html = len(pre_b)
+        end_html = len(pre_b) + len(doc_b)
+        start_frag = len(pre_b) + len(frag_start_b)
+        end_frag = start_frag + len(html_b)
+
+        clipboard_html = (
+            f"Version:0.9\r\n"
+            f"StartHTML:{start_html:09d}\r\n"
+            f"EndHTML:{end_html:09d}\r\n"
+            f"StartFragment:{start_frag:09d}\r\n"
+            f"EndFragment:{end_frag:09d}\r\n"
+            f"{html_doc}"
+        )
+
+        try:
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+
+            # HTML 格式
+            CF_HTML = win32clipboard.RegisterClipboardFormat("HTML Format")
+            win32clipboard.SetClipboardData(CF_HTML, clipboard_html)
+
+            # 纯文本格式（CF_UNICODETEXT = 13）
+            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, plain_text)
+        finally:
+            win32clipboard.CloseClipboard()
 
     def _diagnose_data(self):
         """数据诊断：查询当天 Issues，逐条打印原始数据。"""
@@ -798,6 +977,7 @@ class RedmineReportApp(ctk.CTk):
         self.diag_btn.configure(state="normal", text="🔬 数据诊断")
         self._show_progress(False)
         self._set_status("诊断完成 — 请查看右侧结果")
+        self._set_preview_title("🔬 数据诊断")
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
         self.preview_text.insert("1.0", text)
@@ -808,6 +988,10 @@ class RedmineReportApp(ctk.CTk):
     def _set_status(self, text: str):
         """更新状态栏文字。"""
         self.status_label.configure(text=text)
+
+    def _set_preview_title(self, text: str):
+        """更新右侧预览区标题。"""
+        self.preview_title.configure(text=text)
 
     def _after_status(self, text: str):
         """线程安全地更新状态栏。"""
