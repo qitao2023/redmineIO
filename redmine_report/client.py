@@ -141,12 +141,11 @@ class RedmineClient:
 
             # 新增 — 本人创建 + 当天创建，无需 journal 验证
             if author_id == user_id and created_on == report_date:
-                if tracker_name == "支持" or status_name == "新建":
-                    data = self._extract_issue_data(issue)
-                    if data["issue_id"] not in verified:
-                        verified.add(data["issue_id"])
-                        result.append(data)
-                    continue
+                data = self._extract_issue_data(issue)
+                if data["issue_id"] not in verified:
+                    verified.add(data["issue_id"])
+                    result.append(data)
+                continue
 
             # 其余 Issue 需要 journal 验证
             need_journal_check.append(issue)

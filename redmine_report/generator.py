@@ -70,18 +70,13 @@ def _classify(entry: IssueEntryData, current_user_id: int, report_date: str = ""
         "新增" | "复测" | "审核/复核" | "其他" | "丢弃"
     """
     status = entry.status_name or ""
-    tracker = entry.tracker_name or ""
     is_mine = entry.author_id and entry.author_id == current_user_id
 
-    # 新增：跟踪=支持 + 本人 + 当日创建
-    if tracker == "支持" and is_mine and entry.created_on == report_date:
+    # 新增：本人 + 当日创建（无论当前状态如何，今天创建的就是新增）
+    if is_mine and entry.created_on == report_date:
         return "新增"
 
-    # 新增：状态=新建 + 本人 + 当日创建
-    if status == "新建" and is_mine and entry.created_on == report_date:
-        return "新增"
-
-    # 复测：状态≠新建 + 本人
+    # 复测：状态≠新建 + 本人（非今日创建的本人 Issue）
     if status != "新建" and is_mine:
         return "复测"
 
