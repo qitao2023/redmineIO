@@ -941,12 +941,27 @@ class RedmineReportApp(ctk.CTk):
             for i, (source, iss) in enumerate(all_issues, 1):
                 upd = getattr(iss, 'updated_on', '?')
                 time_str = ""
+                upd_beijing = ""
                 try:
-                    s = str(upd)
-                    if "T" in s:
-                        time_str = s.split("T")[1][:5]
-                    elif " " in s:
-                        time_str = s.split(" ")[1][:5]
+                    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+                    tz_cn = _tz(_td(hours=8))
+                    if isinstance(upd, _dt):
+                        dt_val = upd
+                        if dt_val.tzinfo is None:
+                            dt_val = dt_val.replace(tzinfo=_tz.utc)
+                        cn = dt_val.astimezone(tz_cn)
+                        time_str = cn.strftime("%H:%M")
+                        upd_beijing = cn.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        s = str(upd)
+                        if "T" in s:
+                            s_clean = s.replace("Z", "+00:00")
+                            cn = _dt.fromisoformat(s_clean).astimezone(tz_cn)
+                            time_str = cn.strftime("%H:%M")
+                            upd_beijing = cn.strftime("%Y-%m-%d %H:%M:%S")
+                        elif " " in s:
+                            time_str = s.split(" ")[1][:5]
+                            upd_beijing = s
                 except Exception:
                     pass
 
@@ -959,7 +974,7 @@ class RedmineReportApp(ctk.CTk):
                 lines.append(f"| status | {getattr(iss.status, 'name', '?')} |")
                 lines.append(f"| priority | {getattr(iss.priority, 'name', '?')} |")
                 lines.append(f"| project | {getattr(iss.project, 'name', '?')} |")
-                lines.append(f"| updated_on | {upd} |")
+                lines.append(f"| updated_on | {upd_beijing or upd} |")
                 lines.append(f"| time(HH:MM) | {time_str} |")
                 lines.append("")
 

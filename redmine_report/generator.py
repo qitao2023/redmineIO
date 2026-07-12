@@ -81,7 +81,7 @@ def _classify(entry: IssueEntryData, current_user_id: int) -> str:
     if status == "新建" and is_mine:
         return "新增"
 
-    # 复测：状态不是新建，且创建者是本人
+    # 复测：状态≠新建 + 本人（状态即红mine独立指标，非新建说明已发生过状态变更）
     if status != "新建" and is_mine:
         return "复测"
 
