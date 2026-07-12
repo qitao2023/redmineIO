@@ -168,15 +168,28 @@ class RedmineClient:
                 detailed = self._redmine.issue.get(issue.id, include=["journals"])
             except BaseRedmineError:
                 return None
+
+            author_id = getattr(detailed.author, "id", 0) if hasattr(detailed, "author") else 0
+            status_name = getattr(detailed.status, "name", "")
+
+            # 新建 + 本人 + 当日创建 → 无需 journal 验证
+            if author_id == user_id and status_name == "新建":
+                created_date = self._to_beijing_date(
+                    getattr(detailed, "created_on", None)
+                )
+                if created_date == report_date:
+                    return self._extract_issue_data(detailed)
+
+            # 其他情况：必须当天有 journal 记录
             journals = getattr(detailed, "journals", []) or []
             for journal in journals:
                 journal_user = getattr(journal, "user", None)
                 journal_user_id = getattr(journal_user, "id", None) if journal_user else None
                 if journal_user_id != user_id:
                     continue
-                journal_date = str(getattr(journal, "created_on", ""))[:10]
+                journal_date = self._extract_date(journal)
                 if journal_date == report_date:
-                    return self._extract_issue_data(issue)
+                    return self._extract_issue_data(detailed)
             return None
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -206,6 +219,34 @@ class RedmineClient:
             "time_str": time_str,
             "author_id": getattr(issue.author, "id", 0) if hasattr(issue, "author") else 0,
         }
+
+    @staticmethod
+    def _to_beijing_date(ts: Any) -> str:
+        """将时间戳转为北京时间日期字符串 YYYY-MM-DD。"""
+        if not ts:
+            return ""
+        try:
+            from datetime import timedelta, timezone
+            tz_cn = timezone(timedelta(hours=8))
+            if isinstance(ts, datetime):
+                dt = ts
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(tz_cn).strftime("%Y-%m-%d")
+            s = str(ts)
+            if "T" in s:
+                s_clean = s.replace("Z", "+00:00")
+                return datetime.fromisoformat(s_clean).astimezone(tz_cn).strftime("%Y-%m-%d")
+            return s[:10]
+        except (ValueError, IndexError):
+            return str(ts)[:10]
+
+    @staticmethod
+    def _extract_date(journal: Any) -> str:
+        """从 journal 的 created_on 提取北京时间日期。"""
+        return RedmineClient._to_beijing_date(
+            getattr(journal, "created_on", None)
+        )
 
     @staticmethod
     def _extract_time(timestamp: Any) -> str:
