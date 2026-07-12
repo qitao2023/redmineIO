@@ -24,6 +24,13 @@ SECTION_PREFIX = {
     "其他": "4）其他",
 }
 
+# 跟踪类型排序：支持 → 功能 → BUG → 其他
+_TRACKER_RANK: dict[str, int] = {
+    "支持": 0,
+    "功能": 1,
+    "BUG": 2,
+}
+
 # 优先级排序：数值越小越靠前
 _PRIORITY_RANK: dict[str, int] = {
     "立刻": 0,
@@ -34,13 +41,23 @@ _PRIORITY_RANK: dict[str, int] = {
 }
 
 
-def _priority_key(e: IssueEntryData) -> int:
-    """获取 Issue 的优先级排序键。"""
-    name = e.priority_name or ""
+def _sort_key(e: IssueEntryData) -> tuple[int, int]:
+    """排序键：(跟踪类型, 优先级)，先按类型再按优先级。"""
+    tracker_name = e.tracker_name or ""
+    tracker_rank = 99
+    for kw, rank in _TRACKER_RANK.items():
+        if kw in tracker_name:
+            tracker_rank = rank
+            break
+
+    priority_name = e.priority_name or ""
+    priority_rank = 99
     for kw, rank in _PRIORITY_RANK.items():
-        if kw in name:
-            return rank
-    return 99
+        if kw in priority_name:
+            priority_rank = rank
+            break
+
+    return (tracker_rank, priority_rank)
 
 
 def _format_entry(e: IssueEntryData, show_progress: bool = True) -> str:
@@ -105,7 +122,7 @@ def generate_report(
         groups.setdefault(group, []).append(entry)
 
     for g in groups.values():
-        g.sort(key=_priority_key)
+        g.sort(key=_sort_key)
 
     lines: list[str] = []
 
