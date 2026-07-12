@@ -120,7 +120,6 @@ class RedmineClient:
                 executor.submit(_query_date, report_date, author_id=user_id),
                 executor.submit(_query_date, report_date, assigned_to_id=user_id),
                 executor.submit(_query_date, report_date),
-                executor.submit(_query_date, yesterday),
             ]
             for future in as_completed(futures):
                 try:
