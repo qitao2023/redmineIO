@@ -3,7 +3,7 @@
 import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from redminelib import Redmine
@@ -16,6 +16,24 @@ from redminelib.exceptions import (
 from .models import DailyReport, IssueEntryData
 
 logger = logging.getLogger(__name__)
+
+# 诊断日志：写到 exe 同目录，每次调用动态取路径
+import os as _os
+
+
+def _diag(msg: str) -> None:
+    """写诊断日志到文件（exe 同目录下的 redmine_diag.log）。"""
+    try:
+        log_path = _os.path.join(
+            _os.path.dirname(_os.path.abspath(sys.executable if getattr(sys, "frozen", False) else _os.getcwd())),
+            "redmine_diag.log",
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            from datetime import datetime as _dt
+            f.write(f"[{_dt.now().strftime('%H:%M:%S')}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
 
 # 中文周几映射
 _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -86,66 +104,66 @@ class RedmineClient:
     def get_issues_by_date(
         self, report_date: str, user_id: int, limit: int = 300
     ) -> list[dict[str, Any]]:
-        """获取指定用户在指定日期处理过的 Issues。
+        """获取指定用户在指定日期处理过的 Issues。"""
+        _diag(f"=== 开始查询 report_date={report_date} user_id={user_id} ===")
+        _diag(f"日志路径: {_os.path.join(_os.path.dirname(_os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else _os.getcwd())), 'redmine_diag.log')}")
 
-        三步走：
-        1. 按 author_id / assigned_to_id 收集候选 Issue
-        2. 补上当天更新的其他 Issue（上限 50 个）
-        3. 全部候选并发查 journal，只保留用户当天有操作记录的
-        """
+        # 用两天单日期查询代替范围查询：Redmine 不支持 >< 语法，但支持单日期
+        # 昨天 + 今天，覆盖 UTC 时区偏差（北京时间 0-8 点 = UTC 前一天）
+        dt = datetime.strptime(report_date, "%Y-%m-%d")
+        yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        dates_to_query = [report_date, yesterday]
+        _diag(f"updated_on 查询日期: {dates_to_query}")
+
         seen: set[int] = set()
         candidates: list = []
 
-        # ── 收集候选：策略1+2 ──
-        # 策略1: author_id（用户创建的 Issue，当天有更新）
-        try:
-            for issue in self._redmine.issue.filter(
-                author_id=user_id,
-                updated_on=report_date,
-                sort="updated_on:desc",
-                limit=limit,
-            ):
-                if issue.id not in seen:
-                    seen.add(issue.id)
-                    candidates.append(issue)
-        except BaseRedmineError as e:
-            logger.warning("按 author_id 查询 Issue 失败: %s", str(e)[:100])
+        def _query_date(date_str, **extra_filters):
+            """查询单日 Issue，合并去重到 candidates。"""
+            try:
+                for issue in self._redmine.issue.filter(
+                    updated_on=date_str,
+                    status_id="*",  # 必须！默认只返回 open，加 * 才包含已关闭
+                    sort="updated_on:desc",
+                    limit=limit,
+                    **extra_filters,
+                ):
+                    if issue.id not in seen:
+                        seen.add(issue.id)
+                        candidates.append(issue)
+            except BaseRedmineError as e:
+                logger.warning("查询 %s 失败: %s", date_str, str(e)[:100])
 
-        # 策略2: assigned_to_id（指派给用户的 Issue，当天有更新）
-        try:
-            for issue in self._redmine.issue.filter(
-                assigned_to_id=user_id,
-                updated_on=report_date,
-                sort="updated_on:desc",
-                limit=limit,
-            ):
-                if issue.id not in seen:
-                    seen.add(issue.id)
-                    candidates.append(issue)
-        except BaseRedmineError as e:
-            logger.warning("按 assigned_to_id 查询 Issue 失败: %s", str(e)[:100])
+        # 策略1: author_id（两个日期各查一次）
+        for d in dates_to_query:
+            _query_date(d, author_id=user_id)
 
-        # ── 收集候选：策略3，当天更新但非作者/指派的 Issue ──
-        try:
-            all_updated = self._redmine.issue.filter(
-                updated_on=report_date,
-                sort="updated_on:desc",
-                limit=limit,
-            )
-            for issue in all_updated:
-                if issue.id not in seen:
-                    seen.add(issue.id)
-                    candidates.append(issue)
-                    if len(candidates) > limit + 50:
-                        break
-        except BaseRedmineError as e:
-            logger.warning("策略3 初始查询失败: %s", str(e)[:100])
+        # 策略2: assigned_to_id（两个日期各查一次）
+        for d in dates_to_query:
+            _query_date(d, assigned_to_id=user_id)
+
+        # 策略3: 所有 Issue（两个日期各查一次）
+        for d in dates_to_query:
+            _query_date(d)
+            if len(candidates) > limit + 50:
+                break
 
         # ── 并发 journal 验证：只看今天当事人有操作记录的 ──
+        _diag(f"候选 Issue 共 {len(candidates)} 个:")
+        for iss in candidates:
+            _diag(f"  #{iss.id} "
+                  f"tracker={getattr(iss.tracker, 'name', '?')} "
+                  f"status={getattr(iss.status, 'name', '?')} "
+                  f"author_id={getattr(iss.author, 'id', '?') if hasattr(iss, 'author') else '?'}")
         result: list[dict[str, Any]] = []
         verified: set[int] = set()
         self._check_journals_concurrent(candidates, user_id, report_date,
                                         verified, result)
+        passed_ids = {r["issue_id"] for r in result}
+        _diag(f"验证结果: 通过 {len(result)} / 候选 {len(candidates)}")
+        for iss in candidates:
+            status = "PASS" if iss.id in passed_ids else "FAIL"
+            _diag(f"  {status} #{iss.id}")
 
         # 按时间排序（晚的在上，对应原格式）
         result.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
@@ -159,37 +177,71 @@ class RedmineClient:
         report_date: str,
         seen: set[int],
         result: list[dict[str, Any]],
-        max_workers: int = 10,
+        max_workers: int = 5,
     ):
-        """并发检查 Issue 的 journal，找出用户当天操作过的。"""
+        """并发检查 Issue 的 journal，找出用户当天操作过的。
+
+        降低并发（5 线程）+ 失败重试 2 次，避免多线程共享连接导致静默丢数据。
+        """
+
+        def _fetch_detailed(issue_id: int) -> tuple[Any, list] | None:
+            """获取 Issue 详情 + journals 列表，失败重试 2 次。"""
+            for attempt in range(3):
+                try:
+                    detailed = self._redmine.issue.get(issue_id)
+                    journals = list(detailed.journals)
+                    return detailed, journals
+                except BaseRedmineError:
+                    if attempt < 2:
+                        continue
+            return None
 
         def _check_one(issue):
+            result = _fetch_detailed(issue.id)
+            if result is None:
+                _diag(f"  FAIL #{issue.id}: API 获取详情失败(重试3次)")
+                return None
+            detailed, journals = result
+
             try:
-                detailed = self._redmine.issue.get(issue.id, include=["journals"])
-            except BaseRedmineError:
+                author_id = getattr(detailed.author, "id", 0) if hasattr(detailed, "author") else 0
+                status_name = getattr(detailed.status, "name", "")
+            except Exception:
+                _diag(f"  FAIL #{issue.id}: 读取 author/status 异常")
                 return None
 
-            author_id = getattr(detailed.author, "id", 0) if hasattr(detailed, "author") else 0
-            status_name = getattr(detailed.status, "name", "")
-
-            # 新建 + 本人 + 当日创建 → 无需 journal 验证
+            # 新建 + 本人 + 当日创建 → 无需 journal 验证，直接通过
             if author_id == user_id and status_name == "新建":
                 created_date = self._to_beijing_date(
                     getattr(detailed, "created_on", None)
                 )
                 if created_date == report_date:
-                    return self._extract_issue_data(detailed)
-
-            # 其他情况：必须当天有 journal 记录
-            journals = getattr(detailed, "journals", []) or []
+                    return self._extract_issue_data_safe(detailed)
+                # created_on 不是今天，继续走 journal 检查
+            my_dates: list[str] = []
+            my_count = 0
             for journal in journals:
-                journal_user = getattr(journal, "user", None)
-                journal_user_id = getattr(journal_user, "id", None) if journal_user else None
-                if journal_user_id != user_id:
+                try:
+                    journal_user = getattr(journal, "user", None)
+                    journal_user_id = getattr(journal_user, "id", None) if journal_user else None
+                except Exception:
                     continue
+                if str(journal_user_id) != str(user_id):
+                    continue
+                my_count += 1
                 journal_date = self._extract_date(journal)
+                my_dates.append(journal_date)
                 if journal_date == report_date:
-                    return self._extract_issue_data(detailed)
+                    return self._extract_issue_data_safe(detailed)
+            # 记录失败原因
+            if my_count == 0:
+                _diag(f"  FAIL #{issue.id}: journal 中无本人(user_id={user_id})记录, "
+                      f"author_id={author_id}, status={status_name}, "
+                      f"journal 总数={len(journals)}")
+            else:
+                _diag(f"  FAIL #{issue.id}: 本人有 {my_count} 条记录但日期不匹配, "
+                      f"日期={sorted(set(my_dates))}, 目标={report_date}, "
+                      f"author_id={author_id}, status={status_name}")
             return None
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -202,6 +254,14 @@ class RedmineClient:
                 if data is not None and data["issue_id"] not in seen:
                     seen.add(data["issue_id"])
                     result.append(data)
+
+    def _extract_issue_data_safe(self, issue: Any) -> dict[str, Any] | None:
+        """安全提取 Issue 数据，失败返回 None。"""
+        try:
+            return self._extract_issue_data(issue)
+        except Exception:
+            logger.warning("journal #%d: 提取数据失败", getattr(issue, "id", "?"))
+            return None
 
     def _extract_issue_data(self, issue: Any) -> dict[str, Any]:
         """从 Issue 资源提取结构化数据。"""
