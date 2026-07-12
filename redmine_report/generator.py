@@ -63,25 +63,25 @@ def _format_entry(e: IssueEntryData, show_progress: bool = True) -> str:
     return wrapper.fill(line)
 
 
-def _classify(entry: IssueEntryData, current_user_id: int) -> str:
+def _classify(entry: IssueEntryData, current_user_id: int, report_date: str = "") -> str:
     """根据状态和创建者分类 Issue。
 
     Returns:
-        "新增" | "复测" | "审核/复核" | "其他"
+        "新增" | "复测" | "审核/复核" | "其他" | "丢弃"
     """
     status = entry.status_name or ""
     tracker = entry.tracker_name or ""
     is_mine = entry.author_id and entry.author_id == current_user_id
 
-    # 新增：跟踪=支持 + 本人创建（不限状态）
-    if tracker == "支持" and is_mine:
+    # 新增：跟踪=支持 + 本人 + 当日创建
+    if tracker == "支持" and is_mine and entry.created_on == report_date:
         return "新增"
 
-    # 新增：状态=新建 + 本人创建
-    if status == "新建" and is_mine:
+    # 新增：状态=新建 + 本人 + 当日创建
+    if status == "新建" and is_mine and entry.created_on == report_date:
         return "新增"
 
-    # 复测：状态≠新建 + 本人（状态即红mine独立指标，非新建说明已发生过状态变更）
+    # 复测：状态≠新建 + 本人
     if status != "新建" and is_mine:
         return "复测"
 
@@ -89,8 +89,8 @@ def _classify(entry: IssueEntryData, current_user_id: int) -> str:
     if not is_mine and status:
         return "审核/复核"
 
-    # 兜底
-    return "其他"
+    # 兜底：不做自动归类，丢弃
+    return "丢弃"
 
 
 def generate_report(
@@ -103,11 +103,10 @@ def generate_report(
         "新增": [],
         "复测": [],
         "审核/复核": [],
-        "其他": [],
     }
 
     for entry in report.entries:
-        group = _classify(entry, report.current_user_id)
+        group = _classify(entry, report.current_user_id, report.report_date)
         groups.setdefault(group, []).append(entry)
 
     for g in groups.values():
@@ -125,24 +124,16 @@ def generate_report(
         entries = groups.get(group_key, [])
 
         if group_key == "其他":
+            # 其他只放用户自定义内容，不自动归类 Issue
+            if not custom_other.strip():
+                continue  # 没有自定义内容则不显示本节
             title = SECTION_PREFIX[group_key]
+            lines.append(title)
+            for other_line in custom_other.strip().split("\n"):
+                lines.append(f"   {other_line}")
         else:
             title = f"{SECTION_PREFIX[group_key]}："
-
-        lines.append(title)
-
-        if group_key == "其他":
-            has_content = False
-            for e in entries:
-                has_content = True
-                lines.append(_format_entry(e))
-            if custom_other.strip():
-                for other_line in custom_other.strip().split("\n"):
-                    lines.append(f"   {other_line}")
-                has_content = True
-            if not has_content:
-                lines.append("   无")
-        else:
+            lines.append(title)
             for e in entries:
                 lines.append(_format_entry(e))
 

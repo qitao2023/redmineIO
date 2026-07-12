@@ -16,6 +16,7 @@ class IssueEntryData:
     updated_on: str  # 最后更新时间, "YYYY-MM-DDTHH:MM:SSZ"
     time_str: str  # 从 updated_on 提取的 HH:MM
     author_id: int = 0  # Issue 创建者 ID
+    created_on: str = ""  # Issue 创建日期 YYYY-MM-DD
 
 
 @dataclass
@@ -29,3 +30,4 @@ class DailyReport:
     total_issues: int = 0
     project_count: int = 0
     current_user_id: int = 0  # 当前用户 ID，用于判断复测/复核
+    report_date: str = ""  # 报告日期 YYYY-MM-DD，用于判断是否当日创建

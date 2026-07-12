@@ -979,7 +979,49 @@ class RedmineReportApp(ctk.CTk):
                 lines.append("")
 
             lines.append("---\n")
-            lines.append("## [4] 汇总\n")
+            lines.append("## [4] 分类结果\n")
+            lines.append("| # | 分类 | tracker | status | author |")
+            lines.append("|------|------|------|------|------|")
+            for _i, (_src, iss) in enumerate(all_issues, 1):
+                author_id_val = getattr(iss.author, 'id', 0) if hasattr(iss, 'author') else 0
+                status_val = getattr(iss.status, 'name', '')
+                tracker_val = getattr(iss.tracker, 'name', '')
+                created_raw = getattr(iss, 'created_on', None)
+                created_date = ""
+                try:
+                    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+                    tz_cn = _tz(_td(hours=8))
+                    if isinstance(created_raw, _dt):
+                        dt_val = created_raw
+                        if dt_val.tzinfo is None:
+                            dt_val = dt_val.replace(tzinfo=_tz.utc)
+                        created_date = dt_val.astimezone(tz_cn).strftime("%Y-%m-%d")
+                    elif created_raw:
+                        s = str(created_raw)
+                        if "T" in s:
+                            s_clean = s.replace("Z", "+00:00")
+                            created_date = _dt.fromisoformat(s_clean).astimezone(tz_cn).strftime("%Y-%m-%d")
+                        else:
+                            created_date = s[:10]
+                except Exception:
+                    pass
+                is_mine = author_id_val == user_id
+                # 简易分类（无 journal 数据，has_status_change 默认 True 给复测）
+                if tracker_val == "支持" and is_mine and created_date == report_date:
+                    cat = "新增"
+                elif status_val == "新建" and is_mine and created_date == report_date:
+                    cat = "新增"
+                elif status_val != "新建" and is_mine:
+                    cat = "复测(*)"  # * 需 journal 确认状态变更
+                elif not is_mine and status_val:
+                    cat = "审核/复核"
+                else:
+                    cat = "丢弃"
+                lines.append(f"| {_i} | **{cat}** | {tracker_val} | {status_val} | {'本人' if is_mine else author_id_val} |")
+            lines.append("")
+            lines.append("> 复测(*) = 需 journal 验证确认当天是否有状态变更")
+            lines.append("")
+            lines.append("## [5] 汇总\n")
             lines.append(f"- 查询到 **{len(all_issues)}** 个 Issue\n")
             lines.append("> 如果上面 Issue 数据正常但日报为空，截图发给我。")
 
