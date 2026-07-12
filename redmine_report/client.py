@@ -88,15 +88,15 @@ class RedmineClient:
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
 
-        查询策略：
-        1. author_id + updated_on（用户创建的 Issue）
-        2. assigned_to_id + updated_on（当前指派给用户的 Issue）
-        3. updated_on + 并发 journal 过滤（用户操作过但非作者/指派的 Issue）
-        合并去重，按 updated_on 排序。
+        三步走：
+        1. 按 author_id / assigned_to_id 收集候选 Issue
+        2. 补上当天更新的其他 Issue（上限 50 个）
+        3. 全部候选并发查 journal，只保留用户当天有操作记录的
         """
         seen: set[int] = set()
-        result: list[dict[str, Any]] = []
+        candidates: list = []
 
+        # ── 收集候选：策略1+2 ──
         # 策略1: author_id（用户创建的 Issue，当天有更新）
         try:
             for issue in self._redmine.issue.filter(
@@ -107,7 +107,7 @@ class RedmineClient:
             ):
                 if issue.id not in seen:
                     seen.add(issue.id)
-                    result.append(self._extract_issue_data(issue))
+                    candidates.append(issue)
         except BaseRedmineError as e:
             logger.warning("按 author_id 查询 Issue 失败: %s", str(e)[:100])
 
@@ -121,27 +121,31 @@ class RedmineClient:
             ):
                 if issue.id not in seen:
                     seen.add(issue.id)
-                    result.append(self._extract_issue_data(issue))
+                    candidates.append(issue)
         except BaseRedmineError as e:
             logger.warning("按 assigned_to_id 查询 Issue 失败: %s", str(e)[:100])
 
-        # 策略3: 并发查 journal，覆盖用户审核别人 Issue 后转出的场景
+        # ── 收集候选：策略3，当天更新但非作者/指派的 Issue ──
         try:
-            all_updated = list(self._redmine.issue.filter(
+            all_updated = self._redmine.issue.filter(
                 updated_on=report_date,
                 sort="updated_on:desc",
                 limit=limit,
-            ))
-            uncaptured = [iss for iss in all_updated if iss.id not in seen]
-            # 只查最近 50 个未捕获的
-            uncaptured = uncaptured[:50]
+            )
+            for issue in all_updated:
+                if issue.id not in seen:
+                    seen.add(issue.id)
+                    candidates.append(issue)
+                    if len(candidates) > limit + 50:
+                        break
         except BaseRedmineError as e:
             logger.warning("策略3 初始查询失败: %s", str(e)[:100])
-            uncaptured = []
 
-        if uncaptured:
-            self._check_journals_concurrent(uncaptured, user_id, report_date,
-                                            seen, result)
+        # ── 并发 journal 验证：只看今天当事人有操作记录的 ──
+        result: list[dict[str, Any]] = []
+        verified: set[int] = set()
+        self._check_journals_concurrent(candidates, user_id, report_date,
+                                        verified, result)
 
         # 按时间排序（晚的在上，对应原格式）
         result.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
