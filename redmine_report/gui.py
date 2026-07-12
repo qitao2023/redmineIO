@@ -680,10 +680,10 @@ class RedmineReportApp(ctk.CTk):
 
         # 配置颜色标签
         section_colors = {
-            "1、": "#3b82f6",  # 蓝 — 支持
-            "2、": "#10b981",  # 绿 — 功能
-            "3、": "#ef4444",  # 红 — BUG
-            "4、": "#c026d3",  # 洋红 — 其他
+            "1）": "#3b82f6",  # 蓝 — 新增
+            "2）": "#10b981",  # 绿 — 复测
+            "3）": "#ef4444",  # 红 — 审核/复核
+            "4）": "#c026d3",  # 洋红 — 其他
         }
         for prefix, color in section_colors.items():
             self.preview_text.tag_config(prefix, foreground=color)
@@ -757,10 +757,10 @@ class RedmineReportApp(ctk.CTk):
     def _report_to_html(content: str) -> str:
         """将纯文本日报转为带颜色的 HTML。"""
         SECTION_COLORS = {
-            "1、": "#3b82f6",  # 蓝 — 技术支持
-            "2、": "#10b981",  # 绿 — 功能
-            "3、": "#ef4444",  # 红 — BUG
-            "4、": "#c026d3",  # 洋红 — 其他
+            "1）": "#3b82f6",  # 蓝 — 新增
+            "2）": "#10b981",  # 绿 — 复测
+            "3）": "#ef4444",  # 红 — 审核/复核
+            "4）": "#c026d3",  # 洋红 — 其他
         }
         lines = content.split("\n")
         html_lines = []

@@ -15,6 +15,7 @@ class IssueEntryData:
     priority_name: str  # e.g. "高", "普通", "低"
     updated_on: str  # 最后更新时间, "YYYY-MM-DDTHH:MM:SSZ"
     time_str: str  # 从 updated_on 提取的 HH:MM
+    author_id: int = 0  # Issue 创建者 ID
 
 
 @dataclass
@@ -27,3 +28,4 @@ class DailyReport:
     entries: list[IssueEntryData] = field(default_factory=list)
     total_issues: int = 0
     project_count: int = 0
+    current_user_id: int = 0  # 当前用户 ID，用于判断复测/复核

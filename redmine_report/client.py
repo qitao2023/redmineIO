@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any
 
@@ -88,8 +89,9 @@ class RedmineClient:
         """获取指定用户在指定日期处理过的 Issues。
 
         查询策略：
-        1. 用户作为作者 + updated_on = 报告日期
-        2. 用户作为指派 + updated_on = 报告日期
+        1. author_id + updated_on（用户创建的 Issue）
+        2. assigned_to_id + updated_on（当前指派给用户的 Issue）
+        3. updated_on + 并发 journal 过滤（用户操作过但非作者/指派的 Issue）
         合并去重，按 updated_on 排序。
         """
         seen: set[int] = set()
@@ -123,10 +125,66 @@ class RedmineClient:
         except BaseRedmineError as e:
             logger.warning("按 assigned_to_id 查询 Issue 失败: %s", str(e)[:100])
 
+        # 策略3: 并发查 journal，覆盖用户审核别人 Issue 后转出的场景
+        try:
+            all_updated = list(self._redmine.issue.filter(
+                updated_on=report_date,
+                sort="updated_on:desc",
+                limit=limit,
+            ))
+            uncaptured = [iss for iss in all_updated if iss.id not in seen]
+            # 只查最近 50 个未捕获的
+            uncaptured = uncaptured[:50]
+        except BaseRedmineError as e:
+            logger.warning("策略3 初始查询失败: %s", str(e)[:100])
+            uncaptured = []
+
+        if uncaptured:
+            self._check_journals_concurrent(uncaptured, user_id, report_date,
+                                            seen, result)
+
         # 按时间排序（晚的在上，对应原格式）
         result.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
 
         return result
+
+    def _check_journals_concurrent(
+        self,
+        issues: list,
+        user_id: int,
+        report_date: str,
+        seen: set[int],
+        result: list[dict[str, Any]],
+        max_workers: int = 10,
+    ):
+        """并发检查 Issue 的 journal，找出用户当天操作过的。"""
+
+        def _check_one(issue):
+            try:
+                detailed = self._redmine.issue.get(issue.id, include=["journals"])
+            except BaseRedmineError:
+                return None
+            journals = getattr(detailed, "journals", []) or []
+            for journal in journals:
+                journal_user = getattr(journal, "user", None)
+                journal_user_id = getattr(journal_user, "id", None) if journal_user else None
+                if journal_user_id != user_id:
+                    continue
+                journal_date = str(getattr(journal, "created_on", ""))[:10]
+                if journal_date == report_date:
+                    return self._extract_issue_data(issue)
+            return None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_check_one, iss): iss for iss in issues}
+            for future in as_completed(futures):
+                try:
+                    data = future.result()
+                except Exception:
+                    continue
+                if data is not None and data["issue_id"] not in seen:
+                    seen.add(data["issue_id"])
+                    result.append(data)
 
     def _extract_issue_data(self, issue: Any) -> dict[str, Any]:
         """从 Issue 资源提取结构化数据。"""
@@ -142,6 +200,7 @@ class RedmineClient:
             "priority_name": getattr(issue.priority, "name", ""),
             "updated_on": str(updated) if updated else "",
             "time_str": time_str,
+            "author_id": getattr(issue.author, "id", 0) if hasattr(issue, "author") else 0,
         }
 
     @staticmethod
@@ -209,6 +268,7 @@ class RedmineClient:
                     priority_name=raw["priority_name"],
                     updated_on=raw["updated_on"],
                     time_str=raw["time_str"],
+                    author_id=raw.get("author_id", 0),
                 )
             )
 
@@ -233,4 +293,5 @@ class RedmineClient:
             entries=entries,
             total_issues=len(entries),
             project_count=len(unique_projects),
+            current_user_id=user_id,
         )
