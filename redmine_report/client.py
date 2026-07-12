@@ -2,8 +2,9 @@
 
 import logging
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone as _tz
 from typing import Any
 
 from redminelib import Redmine
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # 中文周几映射
 _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+# 预计算北京时间时区，避免每次调用时重复创建
+_BEIJING_TZ = _tz(timedelta(hours=8))
 
 
 class RedmineClientError(Exception):
@@ -91,8 +95,10 @@ class RedmineClient:
 
         seen: set[int] = set()
         candidates: list = []
+        seen_lock = threading.Lock()
 
         def _query_date(date_str, **extra_filters):
+            """查询一页 Issue，线程安全地加入 candidates。"""
             try:
                 for issue in self._redmine.issue.filter(
                     updated_on=date_str,
@@ -101,26 +107,55 @@ class RedmineClient:
                     limit=limit,
                     **extra_filters,
                 ):
-                    if issue.id not in seen:
-                        seen.add(issue.id)
-                        candidates.append(issue)
+                    with seen_lock:
+                        if issue.id not in seen:
+                            seen.add(issue.id)
+                            candidates.append(issue)
             except BaseRedmineError as e:
                 logger.warning("查询 %s 失败: %s", date_str, str(e)[:100])
 
-        # 策略1+2: 只查今天
-        _query_date(report_date, author_id=user_id)
-        _query_date(report_date, assigned_to_id=user_id)
+        # 并行执行所有 filter 查询（原来串行 ~3-4 次 → 同时发出）
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(_query_date, report_date, author_id=user_id),
+                executor.submit(_query_date, report_date, assigned_to_id=user_id),
+                executor.submit(_query_date, report_date),
+                executor.submit(_query_date, yesterday),
+            ]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass
 
-        # 策略3: 查昨天+今天
-        for d in [report_date, yesterday]:
-            _query_date(d)
-            if len(candidates) > limit + 50:
-                break
-
+        # ── 预分类：从 filter 结果直接判定「新增」类 Issue ──
+        # 这些无需拉取 journals，直接纳入结果
         result: list[dict[str, Any]] = []
         verified: set[int] = set()
-        self._check_journals_concurrent(candidates, user_id, report_date,
-                                        verified, result)
+        need_journal_check: list = []
+
+        for issue in candidates:
+            author_id = getattr(issue.author, "id", 0) if hasattr(issue, "author") else 0
+            status_name = getattr(issue.status, "name", "")
+            tracker_name = getattr(issue.tracker, "name", "")
+            created_on = self._to_beijing_date(getattr(issue, "created_on", None))
+
+            # 新增 — 本人创建 + 当天创建，无需 journal 验证
+            if author_id == user_id and created_on == report_date:
+                if tracker_name == "支持" or status_name == "新建":
+                    data = self._extract_issue_data(issue)
+                    if data["issue_id"] not in verified:
+                        verified.add(data["issue_id"])
+                        result.append(data)
+                    continue
+
+            # 其余 Issue 需要 journal 验证
+            need_journal_check.append(issue)
+
+        # 只对需要验证的 Issue 拉取 journals（原来对所有候选都拉）
+        self._check_journals_concurrent(
+            need_journal_check, user_id, report_date, verified, result
+        )
 
         result.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
         return result
@@ -132,9 +167,9 @@ class RedmineClient:
         report_date: str,
         seen: set[int],
         result: list[dict[str, Any]],
-        max_workers: int = 10,
+        max_workers: int = 20,
     ):
-        """并发检查 Issue 的 journal，10 线程 + 重试 1 次。"""
+        """并发检查 Issue 的 journal，20 线程 + 重试 1 次。"""
 
         def _fetch_detailed(issue_id: int) -> tuple[Any, list] | None:
             for attempt in range(2):
@@ -148,25 +183,13 @@ class RedmineClient:
             return None
 
         def _check_one(issue):
+            """检查单个 Issue 的 journals，验证用户当天是否有操作。"""
             result_item = _fetch_detailed(issue.id)
             if result_item is None:
                 return None
             detailed, journals = result_item
 
-            try:
-                author_id = getattr(detailed.author, "id", 0) if hasattr(detailed, "author") else 0
-                status_name = getattr(detailed.status, "name", "")
-            except Exception:
-                return None
-
-            # 新建 + 本人 + 当日创建 → 直接通过
-            if author_id == user_id and status_name == "新建":
-                created_date = self._to_beijing_date(
-                    getattr(detailed, "created_on", None)
-                )
-                if created_date == report_date:
-                    return self._extract_issue_data(detailed)
-
+            # 遍历 journals 查找用户当天的操作记录
             for journal in journals:
                 try:
                     journal_user = getattr(journal, "user", None)
@@ -217,17 +240,15 @@ class RedmineClient:
         if not ts:
             return ""
         try:
-            from datetime import timedelta as _td, timezone as _tz
-            tz_cn = _tz(_td(hours=8))
             if isinstance(ts, datetime):
                 dt_val = ts
                 if dt_val.tzinfo is None:
                     dt_val = dt_val.replace(tzinfo=_tz.utc)
-                return dt_val.astimezone(tz_cn).strftime("%Y-%m-%d")
+                return dt_val.astimezone(_BEIJING_TZ).strftime("%Y-%m-%d")
             s = str(ts)
             if "T" in s:
                 s_clean = s.replace("Z", "+00:00")
-                return datetime.fromisoformat(s_clean).astimezone(tz_cn).strftime("%Y-%m-%d")
+                return datetime.fromisoformat(s_clean).astimezone(_BEIJING_TZ).strftime("%Y-%m-%d")
             return s[:10]
         except (ValueError, IndexError):
             return str(ts)[:10]
@@ -238,21 +259,18 @@ class RedmineClient:
         if not timestamp:
             return ""
         try:
-            from datetime import timedelta as _td, timezone as _tz
-            tz_cn = _tz(_td(hours=8))
-
             if isinstance(timestamp, datetime):
                 dt_val = timestamp
                 if dt_val.tzinfo is None:
                     dt_val = dt_val.replace(tzinfo=_tz.utc)
-                cn_time = dt_val.astimezone(tz_cn)
+                cn_time = dt_val.astimezone(_BEIJING_TZ)
                 return cn_time.strftime("%H:%M")
 
             s = str(timestamp)
             if "T" in s:
                 s_clean = s.replace("Z", "+00:00")
                 dt_val = datetime.fromisoformat(s_clean)
-                cn_time = dt_val.astimezone(tz_cn)
+                cn_time = dt_val.astimezone(_BEIJING_TZ)
                 return cn_time.strftime("%H:%M")
             if " " in s:
                 return s.split(" ")[1][:5]
