@@ -92,6 +92,7 @@ class Config:
             "output_dir": "./reports",
             "requests_verify": True,
             "requests_timeout": 30,
+            "project_ids": [],  # 手动指定项目 ID 列表，空列表=自动获取
         }
 
     def _find_config(self) -> Path | None:
@@ -124,9 +125,11 @@ class Config:
             rp = raw["report"]
             if "output_dir" in rp:
                 self.data["output_dir"] = rp["output_dir"]
+            if "project_ids" in rp:
+                self.data["project_ids"] = rp["project_ids"]
 
         # 也支持顶层平铺字段
-        for key in ("redmine_url", "api_key", "timezone", "output_dir"):
+        for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids"):
             if key in raw and raw[key]:
                 self.data[key] = raw[key]
 
@@ -172,6 +175,16 @@ class Config:
     @property
     def requests_timeout(self) -> int:
         return self.data["requests_timeout"]
+
+    @property
+    def project_ids(self) -> list[int]:
+        """手动指定的项目 ID 列表。空列表 = 自动从 Redmine 获取。"""
+        ids = self.data.get("project_ids", [])
+        if ids is None:
+            return []
+        if isinstance(ids, list):
+            return [int(i) for i in ids]
+        return []
 
 
 def load_config(

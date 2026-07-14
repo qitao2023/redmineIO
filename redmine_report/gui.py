@@ -450,6 +450,7 @@ class RedmineReportApp(ctk.CTk):
         # 先设默认值
         self.url_entry.delete(0, "end")
         self.url_entry.insert(0, self.DEFAULT_URL)
+        self._project_ids: list[int] = []
 
         try:
             cfg = load_config()
@@ -459,6 +460,7 @@ class RedmineReportApp(ctk.CTk):
             if cfg.api_key:
                 self.key_entry.delete(0, "end")
                 self.key_entry.insert(0, cfg.api_key)
+            self._project_ids = cfg.project_ids or []
         except ConfigError:
             pass  # 没有配置文件也正常
 
@@ -483,6 +485,7 @@ class RedmineReportApp(ctk.CTk):
             if cfg.api_key:
                 self.key_entry.delete(0, "end")
                 self.key_entry.insert(0, cfg.api_key)
+            self._project_ids = cfg.project_ids or []
             self._set_status("配置已加载")
         except ConfigError as e:
             messagebox.showerror("配置错误", str(e))
@@ -650,7 +653,8 @@ class RedmineReportApp(ctk.CTk):
 
             # 获取数据
             self._after_status(f"正在获取 {report_date} 的工作记录...")
-            report = client.build_report_data(report_date)
+            proj_ids = self._project_ids if self._project_ids else None
+            report = client.build_report_data(report_date, project_ids=proj_ids)
 
             # 生成 Markdown
             self._after_status("正在生成日报...")

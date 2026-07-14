@@ -135,7 +135,8 @@ def main(
     # 4. 获取数据
     click.echo(f"正在获取 {date} 的工作记录...", err=True)
     try:
-        report = client.build_report_data(date)
+        proj_ids = cfg.project_ids if cfg.project_ids else None
+        report = client.build_report_data(date, project_ids=proj_ids)
     except RedmineClientError as e:
         click.secho(str(e), fg="red", err=True)
         sys.exit(1)

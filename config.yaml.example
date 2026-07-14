@@ -20,3 +20,9 @@ requests_verify: true
 
 # 请求超时秒数
 requests_timeout: 30
+
+# 限定查询的项目 ID 列表（可选）
+# - 留空（默认）：自动从 Redmine membership API 获取当前用户所属项目
+# - 手动指定：只查询列表中的项目，例如 [17, 23, 45]
+# 手动指定可以提速，适合 membership API 不可用或用户跨项目太多时进行限制
+# project_ids: [17, 23]

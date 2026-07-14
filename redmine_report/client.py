@@ -86,12 +86,57 @@ class RedmineClient:
         except BaseRedmineError as e:
             raise RedmineClientError(f"获取项目列表失败: {str(e)[:200]}") from e
 
+    def _get_user_project_ids(self, user_id: int) -> list[int]:
+        """获取用户实际参与的项目 ID 列表。
+
+        优先通过 membership API 获取用户真实所属项目，
+        失败时回退到 list_projects()（所有可访问项目）。
+        """
+        try:
+            user = self._redmine.user.get(user_id, include="memberships")
+            memberships = getattr(user, "memberships", []) or []
+            project_ids: list[int] = []
+            for m in memberships:
+                proj = getattr(m, "project", None)
+                if proj is not None:
+                    pid = getattr(proj, "id", None)
+                    if pid is not None:
+                        project_ids.append(int(pid))
+            if project_ids:
+                logger.info(
+                    "用户 %s 的 membership 项目: %s", user_id, project_ids
+                )
+                return project_ids
+        except Exception as e:
+            logger.warning("membership API 失败，回退到 list_projects: %s", str(e)[:100])
+
+        # fallback: 所有可访问项目
+        projects = self.list_projects()
+        fallback_ids = [p["id"] for p in projects]
+        logger.info("回退使用 list_projects: %s 个项目", len(fallback_ids))
+        return fallback_ids
+
     def get_issues_by_date(
-        self, report_date: str, user_id: int, limit: int = 300
+        self,
+        report_date: str,
+        user_id: int,
+        project_ids: list[int] | None = None,
+        limit: int = 500,
     ) -> list[dict[str, Any]]:
-        """获取指定用户在指定日期处理过的 Issues。"""
-        dt = datetime.strptime(report_date, "%Y-%m-%d")
-        yesterday = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        """获取指定用户在指定日期处理过的 Issues。
+
+        Args:
+            report_date: 报告日期 YYYY-MM-DD。
+            user_id: 当前用户 ID。
+            project_ids: 限定查询的项目 ID 列表。为 None 时自动获取用户所属项目。
+            limit: 单次查询返回上限（仅用于覆盖 Redmine 默认 25 条分页限制）。
+        """
+        # 自动获取用户所属项目（未手动指定时）
+        if project_ids is None:
+            project_ids = self._get_user_project_ids(user_id)
+        if not project_ids:
+            logger.warning("用户 %s 没有参与任何项目，方案3将跳过", user_id)
+            project_ids = []
 
         seen: set[int] = set()
         candidates: list = []
@@ -112,15 +157,26 @@ class RedmineClient:
                             seen.add(issue.id)
                             candidates.append(issue)
             except BaseRedmineError as e:
-                logger.warning("查询 %s 失败: %s", date_str, str(e)[:100])
+                extra_info = extra_filters.get("project_id", "全站")
+                logger.warning(
+                    "查询 %s (project=%s) 失败: %s",
+                    date_str, extra_info, str(e)[:100],
+                )
 
-        # 并行执行所有 filter 查询（原来串行 ~3-4 次 → 同时发出）
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        # 并行执行所有 filter 查询
+        # 方案1: 本人创建的 + 当天更新
+        # 方案2: 本人经办的 + 当天更新
+        # 方案3: 按项目查询当天所有更新（替代原来的全站查询，大幅减少无效数据）
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [
                 executor.submit(_query_date, report_date, author_id=user_id),
                 executor.submit(_query_date, report_date, assigned_to_id=user_id),
-                executor.submit(_query_date, report_date),
             ]
+            # 方案3: 每个项目独立查询，替代原来的全站拉取
+            for pid in project_ids:
+                futures.append(
+                    executor.submit(_query_date, report_date, project_id=pid)
+                )
             for future in as_completed(futures):
                 try:
                     future.result()
@@ -181,27 +237,43 @@ class RedmineClient:
             return None
 
         def _check_one(issue):
-            """检查单个 Issue 的 journals，验证用户当天是否有操作。"""
+            """检查 journals，找用户当天最后一次改状态的记录。"""
             result_item = _fetch_detailed(issue.id)
             if result_item is None:
                 return None
             detailed, journals = result_item
 
-            # 遍历 journals 查找用户当天的操作记录
-            for journal in journals:
+            # 倒序找用户当天最后一条 journal
+            status_override = ""
+            found = False
+            for journal in reversed(journals):
                 try:
-                    journal_user = getattr(journal, "user", None)
-                    journal_user_id = getattr(journal_user, "id", None) if journal_user else None
+                    ju = getattr(journal, "user", None)
+                    jid = getattr(ju, "id", None) if ju else None
                 except Exception:
                     continue
-                if str(journal_user_id) != str(user_id):
+                if str(jid) != str(user_id):
                     continue
-                journal_date = self._to_beijing_date(
-                    getattr(journal, "created_on", None)
-                )
-                if journal_date == report_date:
-                    return self._extract_issue_data(detailed)
-            return None
+                jd = self._to_beijing_date(getattr(journal, "created_on", None))
+                if jd != report_date:
+                    continue
+                found = True
+
+                # 直接从原始 JSON 提取 status 变更，绕过 redminelib 封装
+                raw = getattr(journal, "_data", {})
+                for d in raw.get("details", []):
+                    if isinstance(d, dict):
+                        if d.get("name") == "status_id":
+                            val = d.get("new_value", "")
+                            if val:
+                                status_override = str(val)
+                                break
+                break
+
+            if not found:
+                return None
+
+            return self._extract_issue_data(detailed, status_override=status_override)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_check_one, iss): iss for iss in issues}
@@ -214,17 +286,22 @@ class RedmineClient:
                     seen.add(data["issue_id"])
                     result.append(data)
 
-    def _extract_issue_data(self, issue: Any) -> dict[str, Any]:
-        """从 Issue 资源提取结构化数据。"""
+    def _extract_issue_data(self, issue: Any, status_override: str = "") -> dict[str, Any]:
+        """从 Issue 资源提取结构化数据。
+
+        status_override: 当事人在 journal 中最后设置的状态，
+                         非空时替代 issue 当前状态。
+        """
         updated = getattr(issue, "updated_on", "")
         time_str = self._extract_time(updated)
+        status = status_override if status_override else getattr(issue.status, "name", "")
 
         return {
             "issue_id": issue.id,
             "subject": issue.subject or "",
             "project_name": getattr(issue.project, "name", ""),
             "tracker_name": getattr(issue.tracker, "name", ""),
-            "status_name": getattr(issue.status, "name", ""),
+            "status_name": status,
             "priority_name": getattr(issue.priority, "name", ""),
             "updated_on": str(updated) if updated else "",
             "time_str": time_str,
@@ -276,15 +353,24 @@ class RedmineClient:
             pass
         return ""
 
-    def build_report_data(self, report_date: str | None = None) -> DailyReport:
-        """编排所有 API 调用，构建完整的 DailyReport 对象。"""
+    def build_report_data(
+        self,
+        report_date: str | None = None,
+        project_ids: list[int] | None = None,
+    ) -> DailyReport:
+        """编排所有 API 调用，构建完整的 DailyReport 对象。
+
+        Args:
+            report_date: 报告日期 YYYY-MM-DD，None=今天。
+            project_ids: 限定查询的项目 ID 列表，None=自动获取。
+        """
         if report_date is None:
             report_date = date.today().isoformat()
 
         user_info = self.authenticate()
         user_id = user_info["id"]
 
-        raw_issues = self.get_issues_by_date(report_date, user_id)
+        raw_issues = self.get_issues_by_date(report_date, user_id, project_ids=project_ids)
         print(
             f"找到 {len(raw_issues)} 个 Issue（{report_date}）",
             file=sys.stderr,
