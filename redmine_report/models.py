@@ -31,3 +31,4 @@ class DailyReport:
     project_count: int = 0
     current_user_id: int = 0  # 当前用户 ID，用于判断复测/复核
     report_date: str = ""  # 报告日期 YYYY-MM-DD，用于判断是否当日创建
+    timing: dict = field(default_factory=dict)  # 各阶段耗时统计

@@ -155,6 +155,6 @@ def generate_report(
     if end_time is None:
         end_time = datetime.now().strftime("%H:%M")
     lines.append(f"上班时间：08:30，下班时间：{end_time}")
-    lines.append("中途外出记录")
+    lines.append("中途外出记录：无")
 
     return "\n".join(lines) + "\n"

@@ -2,13 +2,38 @@
 
 import sys
 from datetime import date
+from pathlib import Path
 
 import click
+import yaml
 
 from .config import ConfigError, load_config
 from .client import RedmineClient, RedmineClientError
 from .generator import generate_report
 from .writer import write_report
+
+
+def _get_config_write_path() -> Path:
+    """获取 config.yaml 写入路径。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent / "config.yaml"
+    return Path("config.yaml")
+
+
+def _save_project_ids(project_ids: list[int], config_path: Path) -> None:
+    """将 project_ids 写入配置文件（保留已有字段）。"""
+    existing: dict = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                existing = yaml.safe_load(f) or {}
+        except Exception:
+            pass
+
+    existing["project_ids"] = project_ids
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(existing, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
 @click.command()
@@ -39,6 +64,11 @@ from .writer import write_report
     help="列出所有可访问项目并退出",
 )
 @click.option(
+    "--setup",
+    is_flag=True,
+    help="交互式选择要跟踪的项目，写入 config.yaml 后退出",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="仅获取数据并打印摘要，不生成完整报告",
@@ -54,6 +84,7 @@ def main(
     config_path: str | None,
     to_stdout: bool,
     list_projects_flag: bool,
+    setup: bool,
     dry_run: bool,
     test_connection_flag: bool,
 ):
@@ -66,6 +97,8 @@ def main(
       redmine-report -o ~/Desktop/日报.md      自定义输出路径
       redmine-report --dry-run                预览数据摘要
       redmine-report --list-projects          列出可访问项目
+      redmine-report --setup                  重新选择要跟踪的项目
+      redmine-report --setup                  选择要跟踪的项目
     """
     # 1. 加载配置
     try:
@@ -86,7 +119,12 @@ def main(
         click.secho(str(e), fg="red", err=True)
         sys.exit(1)
 
-    # 3. --test-connection
+    # 3. --setup: 交互式选择项目
+    if setup:
+        _do_setup(client, config_path)
+        return
+
+    # 3. --test-connection / --setup
     if test_connection_flag:
         click.echo("=== Redmine 连接测试 ===\n")
         click.echo(f"服务器: {cfg.redmine_url}")
@@ -132,16 +170,45 @@ def main(
             sys.exit(1)
         return
 
-    # 4. 获取数据
+    # 5. 未配置 project_ids 时 → 自动弹出项目选择
+    if not cfg.project_ids:
+        if sys.stdin.isatty():
+            click.echo()
+            click.secho("⚡ 首次使用：请选择要跟踪的项目", fg="cyan", err=True)
+            _do_setup(client, config_path)
+            # 重新加载配置以获取刚写入的 project_ids
+            try:
+                cfg = load_config(config_path=config_path)
+            except ConfigError:
+                pass
+        else:
+            click.secho(
+                "⚠ 未配置 project_ids，将自动获取所有项目（建议先运行 --setup）",
+                fg="yellow", err=True,
+            )
+
+    # 6. 显示当前跟踪的项目
+    if cfg.project_ids:
+        proj_ids = cfg.project_ids
+        try:
+            all_projects = {p["id"]: p["name"] for p in client.list_projects()}
+            names = [all_projects.get(pid, f"#{pid}") for pid in proj_ids]
+            click.echo(f"跟踪项目 ({len(proj_ids)}个): {', '.join(names)}", err=True)
+            click.echo(f"  （修改选项目: redmine-report --setup）", err=True)
+        except Exception:
+            pass
+    else:
+        proj_ids = None
+
+    # 7. 获取数据
     click.echo(f"正在获取 {date} 的工作记录...", err=True)
     try:
-        proj_ids = cfg.project_ids if cfg.project_ids else None
         report = client.build_report_data(date, project_ids=proj_ids)
     except RedmineClientError as e:
         click.secho(str(e), fg="red", err=True)
         sys.exit(1)
 
-    # 5. --dry-run
+    # 8. --dry-run
     if dry_run:
         click.echo(f"\n=== 数据摘要 ({date}) ===")
         click.echo(f"  用户:     {report.user_name}")
@@ -158,10 +225,10 @@ def main(
                 )
         return
 
-    # 6. 生成报告
+    # 9. 生成报告
     content = generate_report(report)
 
-    # 7. 输出
+    # 10. 输出
     if to_stdout:
         write_report(content)
     else:
@@ -169,6 +236,70 @@ def main(
             output = f"{cfg.output_dir}/日报-{date}.md"
         path = write_report(content, output)
         click.echo(f"日报已生成: {path}", err=True)
+
+
+def _do_setup(client: RedmineClient, cli_config_path: str | None) -> None:
+    """交互式项目选择：拉取用户项目 → 展示列表 → 用户勾选 → 写入 yaml。"""
+    click.echo()
+    click.echo("=== 项目跟踪设置 ===")
+    click.echo()
+
+    # 认证
+    try:
+        user = client.authenticate()
+        click.echo(f"用户: {user['name']} (ID={user['id']})")
+    except RedmineClientError as e:
+        click.secho(str(e), fg="red", err=True)
+        sys.exit(1)
+
+    # 拉取项目
+    click.echo("正在获取您的项目列表...")
+    project_ids = client._get_user_project_ids(user["id"])
+    if not project_ids:
+        click.secho("未找到任何项目，请确认 Redmine 账号权限。", fg="yellow", err=True)
+        sys.exit(1)
+
+    # 获取项目名称
+    all_projects = {p["id"]: p for p in client.list_projects()}
+
+    # 展示列表
+    click.echo(f"\n找到 {len(project_ids)} 个项目（默认全部勾选）：\n")
+    for i, pid in enumerate(project_ids, 1):
+        name = all_projects.get(pid, {}).get("name", f"项目#{pid}")
+        click.echo(f"  [{i}] {name}")
+
+    click.echo()
+    click.echo("输入要去掉的项目编号（逗号分隔），或直接回车确认全部：")
+    choice = click.prompt("", default="").strip()
+
+    # 解析选择
+    if choice:
+        try:
+            exclude_indices = {
+                int(x.strip()) - 1 for x in choice.split(",") if x.strip()
+            }
+        except ValueError:
+            click.secho("输入格式有误，已取消。", fg="red", err=True)
+            return
+        selected = [
+            pid for i, pid in enumerate(project_ids) if i not in exclude_indices
+        ]
+    else:
+        selected = project_ids
+
+    if not selected:
+        click.secho("没有选中任何项目，已取消。", fg="yellow", err=True)
+        return
+
+    # 写入配置
+    write_path = _get_config_write_path()
+    _save_project_ids(selected, write_path)
+
+    click.echo()
+    click.echo(f"✓ 已保存 {len(selected)} 个项目到 {write_path}")
+    for pid in selected:
+        name = all_projects.get(pid, {}).get("name", f"项目#{pid}")
+        click.echo(f"  - {name}")
 
 
 if __name__ == "__main__":

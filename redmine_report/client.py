@@ -3,10 +3,12 @@
 import logging
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone as _tz
 from typing import Any
 
+import requests as _requests
 from redminelib import Redmine
 from redminelib.exceptions import (
     AuthError,
@@ -37,6 +39,7 @@ class RedmineClient:
         self.url = url.rstrip("/")
         self._api_key = api_key
         self._redmine: Redmine | None = None
+        self._last_timing: dict = {}
 
         try:
             self._redmine = Redmine(
@@ -86,12 +89,58 @@ class RedmineClient:
         except BaseRedmineError as e:
             raise RedmineClientError(f"获取项目列表失败: {str(e)[:200]}") from e
 
+    def _get_user_activity_issues(self, user_id: int, date_str: str) -> tuple[set[int], str]:
+        """通过 Redmine 活动 API 快速定位用户当天参与过的 Issue ID。
+
+        比起逐个拉 journal，一次请求即可筛掉无关 Issue。
+        返回 (issue_ids, error_msg)。
+        """
+        url = f"{self.url}/activity.json"
+        try:
+            resp = _requests.get(
+                url,
+                params={
+                    "user_id": user_id,
+                    "from": date_str,
+                    "to": date_str,
+                    "limit": 500,
+                },
+                headers={
+                    "X-Redmine-API-Key": self._api_key,
+                    "Accept": "application/json",
+                },
+                timeout=30,
+            )
+            status = resp.status_code
+            if status != 200:
+                return set(), f"HTTP {status}"
+            data = resp.json()
+            events = data.get("events", [])
+            issue_ids: set[int] = set()
+            for event in events:
+                etype = event.get("event_type", "")
+                if etype in ("issue", "issue-closed", "issue-edit", "issue-note"):
+                    try:
+                        url_parts = event.get("url", "").rstrip("/").split("/")
+                        iid = int(url_parts[-1])
+                        issue_ids.add(iid)
+                    except (ValueError, IndexError):
+                        pass
+            logger.info(
+                "活动 API 返回 %s 条事件，命中 %s 个 Issue",
+                len(events), len(issue_ids),
+            )
+            return issue_ids, ""
+        except Exception as e:
+            return set(), str(e)[:100]
+
     def _get_user_project_ids(self, user_id: int) -> list[int]:
         """获取用户实际参与的项目 ID 列表。
 
         优先通过 membership API 获取用户真实所属项目，
         失败时回退到 list_projects()（所有可访问项目）。
         """
+        t0 = time.perf_counter()
         try:
             user = self._redmine.user.get(user_id, include="memberships")
             memberships = getattr(user, "memberships", []) or []
@@ -102,18 +151,25 @@ class RedmineClient:
                     pid = getattr(proj, "id", None)
                     if pid is not None:
                         project_ids.append(int(pid))
+            elapsed = time.perf_counter() - t0
             if project_ids:
                 logger.info(
                     "用户 %s 的 membership 项目: %s", user_id, project_ids
                 )
+                print(f"  [计时] 获取用户项目 (membership API): {elapsed:.2f}s，{len(project_ids)} 个项目", file=sys.stderr)
                 return project_ids
         except Exception as e:
+            elapsed = time.perf_counter() - t0
             logger.warning("membership API 失败，回退到 list_projects: %s", str(e)[:100])
+            print(f"  [计时] membership API 失败 ({elapsed:.2f}s)，回退到 list_projects", file=sys.stderr)
 
         # fallback: 所有可访问项目
+        t0 = time.perf_counter()
         projects = self.list_projects()
         fallback_ids = [p["id"] for p in projects]
+        elapsed = time.perf_counter() - t0
         logger.info("回退使用 list_projects: %s 个项目", len(fallback_ids))
+        print(f"  [计时] 获取用户项目 (list_projects 兜底): {elapsed:.2f}s，{len(fallback_ids)} 个项目", file=sys.stderr)
         return fallback_ids
 
     def get_issues_by_date(
@@ -121,7 +177,7 @@ class RedmineClient:
         report_date: str,
         user_id: int,
         project_ids: list[int] | None = None,
-        limit: int = 500,
+        limit: int = 300,
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
 
@@ -131,19 +187,15 @@ class RedmineClient:
             project_ids: 限定查询的项目 ID 列表。为 None 时自动获取用户所属项目。
             limit: 单次查询返回上限（仅用于覆盖 Redmine 默认 25 条分页限制）。
         """
-        # 自动获取用户所属项目（未手动指定时）
-        if project_ids is None:
-            project_ids = self._get_user_project_ids(user_id)
-        if not project_ids:
-            logger.warning("用户 %s 没有参与任何项目，方案3将跳过", user_id)
-            project_ids = []
+        # project_ids 为空时：方案3 回退到原来的全站查询（不额外调用 membership API）
+        t_total_start = time.perf_counter()
 
         seen: set[int] = set()
         candidates: list = []
         seen_lock = threading.Lock()
 
         def _query_date(date_str, **extra_filters):
-            """查询一页 Issue，线程安全地加入 candidates。"""
+            """查询全站 Issue（无项目限定时使用）。"""
             try:
                 for issue in self._redmine.issue.filter(
                     updated_on=date_str,
@@ -157,34 +209,52 @@ class RedmineClient:
                             seen.add(issue.id)
                             candidates.append(issue)
             except BaseRedmineError as e:
-                extra_info = extra_filters.get("project_id", "全站")
-                logger.warning(
-                    "查询 %s (project=%s) 失败: %s",
-                    date_str, extra_info, str(e)[:100],
-                )
+                logger.warning("查询 %s 失败: %s", date_str, str(e)[:100])
 
-        # 并行执行所有 filter 查询
-        # 方案1: 本人创建的 + 当天更新
-        # 方案2: 本人经办的 + 当天更新
-        # 方案3: 按项目查询当天所有更新（替代原来的全站查询，大幅减少无效数据）
+        # ═══ 阶段1: 并行 filter 查询 ═══
+        t1 = time.perf_counter()
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [
-                executor.submit(_query_date, report_date, author_id=user_id),
-                executor.submit(_query_date, report_date, assigned_to_id=user_id),
-            ]
-            # 方案3: 每个项目独立查询，替代原来的全站拉取
-            for pid in project_ids:
-                futures.append(
-                    executor.submit(_query_date, report_date, project_id=pid)
-                )
+            if project_ids:
+                # 有项目限定：三种方案全部按项目拆分，project_id 作为 filter 参数
+                futures = []
+                for pid in project_ids:
+                    futures.append(
+                        executor.submit(_query_date, report_date, author_id=user_id, project_id=pid)
+                    )
+                    futures.append(
+                        executor.submit(_query_date, report_date, assigned_to_id=user_id, project_id=pid)
+                    )
+                    futures.append(
+                        executor.submit(_query_date, report_date, project_id=pid)
+                    )
+            else:
+                # 未配置项目：回退原逻辑（全站查询）
+                futures = [
+                    executor.submit(_query_date, report_date, author_id=user_id),
+                    executor.submit(_query_date, report_date, assigned_to_id=user_id),
+                    executor.submit(_query_date, report_date),
+                ]
             for future in as_completed(futures):
                 try:
                     future.result()
                 except Exception:
                     pass
+        t2 = time.perf_counter()
+        filter_elapsed = t2 - t1
+        query_count = len(futures)
+        print(
+            f"  [计时] 阶段1-filter查询: {filter_elapsed:.2f}s，"
+            f"共 {query_count} 次查询，候选 {len(candidates)} 个 Issue",
+            file=sys.stderr,
+        )
 
-        # ── 预分类：从 filter 结果直接判定「新增」类 Issue ──
-        # 这些无需拉取 journals，直接纳入结果
+        # ── 收集候选 Issue 详情（供调试召回）──
+        candidates_detail: list[str] = []
+        for issue in candidates:
+            proj = getattr(issue.project, "name", "?") if hasattr(issue, "project") else "?"
+            candidates_detail.append(f"#{issue.id} [{proj}] {issue.subject or ''}")
+
+        # ═══ 阶段2: 预分类（新增检测） ═══
         result: list[dict[str, Any]] = []
         verified: set[int] = set()
         need_journal_check: list = []
@@ -206,12 +276,50 @@ class RedmineClient:
             # 其余 Issue 需要 journal 验证
             need_journal_check.append(issue)
 
-        # 只对需要验证的 Issue 拉取 journals（原来对所有候选都拉）
+        t3 = time.perf_counter()
+        print(
+            f"  [计时] 阶段2-预分类: {t3 - t2:.2f}s，"
+            f"新增 {len(result)} 个 + 待验证 {len(need_journal_check)} 个",
+            file=sys.stderr,
+        )
+
+        # ═══ 阶段3: journal 验证 ═══
+        result_before_journal = len(result)
         self._check_journals_concurrent(
             need_journal_check, user_id, report_date, verified, result
         )
+        t4 = time.perf_counter()
+        journal_elapsed = t4 - t3
+        confirmed_by_journal = len(result) - result_before_journal
+        print(
+            f"  [计时] 阶段3-journal验证: {journal_elapsed:.2f}s，"
+            f"检查 {len(need_journal_check)} 个 → 确认 {confirmed_by_journal} 个",
+            file=sys.stderr,
+        )
 
         result.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
+
+        t_total = time.perf_counter() - t_total_start
+        timing = {
+            "filter": filter_elapsed,
+            "filter_queries": query_count,
+            "filter_candidates": len(candidates),
+            "candidates_detail": candidates_detail,
+            "preclassify": round(t3 - t2, 2),
+            "preclassify_new": len(result) - confirmed_by_journal,
+            "preclassify_pending": len(need_journal_check),
+            "journal": journal_elapsed,
+            "journal_checked": len(need_journal_check),
+            "journal_confirmed": confirmed_by_journal,
+            "total": round(t_total, 2),
+        }
+        self._last_timing = timing
+        print(
+            f"  [计时] get_issues_by_date 总计: {t_total:.2f}s "
+            f"(filter={filter_elapsed:.2f} + 预分类={t3 - t2:.2f} "
+            f"+ 活动API={t_act_elapsed:.2f} + journal={journal_elapsed:.2f})",
+            file=sys.stderr,
+        )
         return result
 
     def _check_journals_concurrent(
@@ -224,6 +332,13 @@ class RedmineClient:
         max_workers: int = 20,
     ):
         """并发检查 Issue 的 journal，20 线程 + 重试 1 次。"""
+        if not issues:
+            return
+
+        t0 = time.perf_counter()
+        total_fetched = 0
+        total_failed = 0
+        count_lock = threading.Lock()
 
         def _fetch_detailed(issue_id: int) -> tuple[Any, list] | None:
             for attempt in range(2):
@@ -238,9 +353,14 @@ class RedmineClient:
 
         def _check_one(issue):
             """检查 journals，找用户当天最后一次改状态的记录。"""
+            nonlocal total_fetched, total_failed
             result_item = _fetch_detailed(issue.id)
             if result_item is None:
+                with count_lock:
+                    total_failed += 1
                 return None
+            with count_lock:
+                total_fetched += 1
             detailed, journals = result_item
 
             # 倒序找用户当天最后一条 journal
@@ -285,6 +405,14 @@ class RedmineClient:
                 if data is not None and data["issue_id"] not in seen:
                     seen.add(data["issue_id"])
                     result.append(data)
+
+        elapsed = time.perf_counter() - t0
+        avg_per = elapsed / len(issues) if issues else 0
+        print(
+            f"    [计时] journal内部: {elapsed:.2f}s（{len(issues)}个，"
+            f"成功{total_fetched}/失败{total_failed}，均{avg_per:.2f}s/个）",
+            file=sys.stderr,
+        )
 
     def _extract_issue_data(self, issue: Any, status_override: str = "") -> dict[str, Any]:
         """从 Issue 资源提取结构化数据。
@@ -364,11 +492,14 @@ class RedmineClient:
             report_date: 报告日期 YYYY-MM-DD，None=今天。
             project_ids: 限定查询的项目 ID 列表，None=自动获取。
         """
+        t_build_start = time.perf_counter()
         if report_date is None:
             report_date = date.today().isoformat()
 
+        t_auth_start = time.perf_counter()
         user_info = self.authenticate()
         user_id = user_info["id"]
+        auth_elapsed = time.perf_counter() - t_auth_start
 
         raw_issues = self.get_issues_by_date(report_date, user_id, project_ids=project_ids)
         print(
@@ -411,6 +542,10 @@ class RedmineClient:
             weekday_idx = 0
         weekday_cn = _WEEKDAY_CN[weekday_idx] if 0 <= weekday_idx < 7 else ""
 
+        timing = dict(self._last_timing)
+        timing["auth"] = round(auth_elapsed, 2)
+        timing["build_total"] = round(time.perf_counter() - t_build_start, 2)
+
         return DailyReport(
             user_name=user_info["name"],
             date=report_date,
@@ -420,4 +555,5 @@ class RedmineClient:
             project_count=len(unique_projects),
             current_user_id=user_id,
             report_date=report_date,
+            timing=timing,
         )
