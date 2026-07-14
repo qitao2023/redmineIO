@@ -131,20 +131,24 @@ def generate_report(
         f"{report.user_name}-{report.weekday_cn}工作汇报（{report.date}）"
     )
 
-    # 按顺序输出各分组
+    # 按顺序输出各分组（节号动态计算，空节跳过不占号）
+    section_num = 0
     for group_key in SECTION_ORDER:
         entries = groups.get(group_key, [])
 
         if group_key == "其他":
-            # 其他只放用户自定义内容，不自动归类 Issue
             if not custom_other.strip():
-                continue  # 没有自定义内容则不显示本节
-            title = SECTION_PREFIX[group_key]
+                continue
+            section_num += 1
+            title = f"{section_num}）其他"
             lines.append(title)
             for other_line in custom_other.strip().split("\n"):
                 lines.append(f"   {other_line}")
         else:
-            title = f"{SECTION_PREFIX[group_key]}："
+            if not entries:
+                continue
+            section_num += 1
+            title = f"{section_num}）{group_key}："
             lines.append(title)
             for e in entries:
                 lines.append(_format_entry(e))

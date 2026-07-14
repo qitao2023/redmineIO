@@ -93,6 +93,7 @@ class Config:
             "requests_verify": True,
             "requests_timeout": 30,
             "project_ids": [],  # 手动指定项目 ID 列表，空列表=自动获取
+            "skip_review": False,  # True=跳过审核复核，只查本人创建/经办的 Issue
         }
 
     def _find_config(self) -> Path | None:
@@ -127,9 +128,11 @@ class Config:
                 self.data["output_dir"] = rp["output_dir"]
             if "project_ids" in rp:
                 self.data["project_ids"] = rp["project_ids"]
+            if "skip_review" in rp:
+                self.data["skip_review"] = rp["skip_review"]
 
         # 也支持顶层平铺字段
-        for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids"):
+        for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids", "skip_review"):
             if key in raw and raw[key]:
                 self.data[key] = raw[key]
 
@@ -185,6 +188,11 @@ class Config:
         if isinstance(ids, list):
             return [int(i) for i in ids]
         return []
+
+    @property
+    def skip_review(self) -> bool:
+        """是否跳过审核复核（只查本人创建/经办的 Issue）。"""
+        return bool(self.data.get("skip_review", False))
 
 
 def load_config(

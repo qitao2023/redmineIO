@@ -89,21 +89,22 @@ class RedmineClient:
         except BaseRedmineError as e:
             raise RedmineClientError(f"获取项目列表失败: {str(e)[:200]}") from e
 
-    def _get_user_activity_issues(self, user_id: int, date_str: str) -> tuple[set[int], str]:
-        """通过 Redmine 活动 API 快速定位用户当天参与过的 Issue ID。
-
-        比起逐个拉 journal，一次请求即可筛掉无关 Issue。
-        返回 (issue_ids, error_msg)。
+    def _search_user_issues(self, user_name: str, date_str: str) -> tuple[set[int], str, str]:
+        """通过 Redmine 搜索 API 快速定位用户名字出现过的 Issue。
+        返回 (issue_ids, error_msg, debug_info)。
         """
-        url = f"{self.url}/activity.json"
+        q = f'user="{user_name}"'
+        url = f"{self.url}/search.json"
+        debug_parts = [f"URL: {url}?q={q}&issues=1"]
         try:
             resp = _requests.get(
                 url,
                 params={
-                    "user_id": user_id,
-                    "from": date_str,
-                    "to": date_str,
-                    "limit": 500,
+                    "q": q,
+                    "issues": 1,
+                    "titles_only": 0,
+                    "limit": 200,
+                    "offset": 0,
                 },
                 headers={
                     "X-Redmine-API-Key": self._api_key,
@@ -112,27 +113,45 @@ class RedmineClient:
                 timeout=30,
             )
             status = resp.status_code
+            debug_parts.append(f"HTTP {status}")
             if status != 200:
-                return set(), f"HTTP {status}"
+                return set(), f"HTTP {status}", " | ".join(debug_parts)
             data = resp.json()
-            events = data.get("events", [])
+            total = data.get("total_count", 0)
+            results = data.get("results", [])
+            debug_parts.append(f"total={total}, results_count={len(results)}")
             issue_ids: set[int] = set()
-            for event in events:
-                etype = event.get("event_type", "")
-                if etype in ("issue", "issue-closed", "issue-edit", "issue-note"):
+            raw_samples: list[str] = []
+            for i, item in enumerate(results):
+                iid = None
+                item_url = item.get("url", "")
+                for part in reversed(item_url.rstrip("/").split("/")):
                     try:
-                        url_parts = event.get("url", "").rstrip("/").split("/")
-                        iid = int(url_parts[-1])
-                        issue_ids.add(iid)
-                    except (ValueError, IndexError):
+                        iid = int(part)
+                        break
+                    except ValueError:
+                        continue
+                if iid is None:
+                    iid = item.get("id")
+                if iid is not None:
+                    try:
+                        issue_ids.add(int(iid))
+                    except (ValueError, TypeError):
                         pass
-            logger.info(
-                "活动 API 返回 %s 条事件，命中 %s 个 Issue",
-                len(events), len(issue_ids),
-            )
-            return issue_ids, ""
+                if i < 5:
+                    raw_samples.append(
+                        f"#{i}: id={item.get('id')}, type={item.get('type')}, "
+                        f"title={str(item.get('title',''))[:60]}, url={item_url}"
+                    )
+            err = ""
+            if results and not issue_ids:
+                first = results[0]
+                err = f"解析不到ID, first_keys={list(first.keys())[:10]}"
+            debug_info = " | ".join(debug_parts) + "\n" + "\n".join(raw_samples)
+            logger.info("搜索 API: %s", debug_info.replace("\n", " | "))
+            return issue_ids, err, debug_info
         except Exception as e:
-            return set(), str(e)[:100]
+            return set(), str(e)[:100], " | ".join(debug_parts) + f" EXCEPTION: {e}"
 
     def _get_user_project_ids(self, user_id: int) -> list[int]:
         """获取用户实际参与的项目 ID 列表。
@@ -177,6 +196,8 @@ class RedmineClient:
         report_date: str,
         user_id: int,
         project_ids: list[int] | None = None,
+        user_name: str = "",
+        skip_review: bool = False,
         limit: int = 300,
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
@@ -185,6 +206,8 @@ class RedmineClient:
             report_date: 报告日期 YYYY-MM-DD。
             user_id: 当前用户 ID。
             project_ids: 限定查询的项目 ID 列表。为 None 时自动获取用户所属项目。
+            user_name: 当前用户名（用于搜索 API 预筛）。
+            skip_review: True=跳过方案3（不查审核复核），大幅提速。
             limit: 单次查询返回上限（仅用于覆盖 Redmine 默认 25 条分页限制）。
         """
         # project_ids 为空时：方案3 回退到原来的全站查询（不额外调用 membership API）
@@ -215,7 +238,6 @@ class RedmineClient:
         t1 = time.perf_counter()
         with ThreadPoolExecutor(max_workers=8) as executor:
             if project_ids:
-                # 有项目限定：三种方案全部按项目拆分，project_id 作为 filter 参数
                 futures = []
                 for pid in project_ids:
                     futures.append(
@@ -224,9 +246,10 @@ class RedmineClient:
                     futures.append(
                         executor.submit(_query_date, report_date, assigned_to_id=user_id, project_id=pid)
                     )
-                    futures.append(
-                        executor.submit(_query_date, report_date, project_id=pid)
-                    )
+                    if not skip_review:
+                        futures.append(
+                            executor.submit(_query_date, report_date, project_id=pid)
+                        )
             else:
                 # 未配置项目：回退原逻辑（全站查询）
                 futures = [
@@ -283,6 +306,31 @@ class RedmineClient:
             file=sys.stderr,
         )
 
+        # ═══ 阶段2.5: 搜索 API 预筛 ═══
+        t_act_start = time.perf_counter()
+        search_issues: set[int] = set()
+        search_error = ""
+        search_debug = ""
+        if user_name:
+            search_issues, search_error, search_debug = self._search_user_issues(user_name, report_date)
+        skipped_by_search = 0
+        if search_issues:
+            filtered = []
+            for issue in need_journal_check:
+                if issue.id in search_issues:
+                    filtered.append(issue)
+                else:
+                    skipped_by_search += 1
+            if filtered or skipped_by_search > 0:
+                need_journal_check = filtered
+        t_act_elapsed = time.perf_counter() - t_act_start
+        prefix = f"FAIL({search_error}) " if search_error else ""
+        print(
+            f"  [计时] 搜索API预筛: {prefix}{t_act_elapsed:.2f}s，"
+            f"命中 {len(search_issues)} 个Issue，筛掉 {skipped_by_search} 个无关",
+            file=sys.stderr,
+        )
+
         # ═══ 阶段3: journal 验证 ═══
         result_before_journal = len(result)
         self._check_journals_concurrent(
@@ -299,6 +347,45 @@ class RedmineClient:
 
         result.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
 
+        # ── 调试：抓一条已确认 Issue 的 journal 原始内容 ──
+        journal_debug: list[str] = []
+        for entry in result[:3]:
+            try:
+                detail = self._redmine.issue.get(entry["issue_id"], include="journals")
+                journal_debug.append(f"--- Issue #{entry['issue_id']} journals ---")
+                for j in reversed(list(getattr(detail, "journals", []))):
+                    ju = getattr(j, "user", None)
+                    uname = getattr(ju, "name", "?") if ju else "?"
+                    jtime_raw = getattr(j, "created_on", None)
+                    jtime = self._to_beijing_date(jtime_raw) + " " + self._extract_time(jtime_raw) if jtime_raw else "?"
+                    notes = getattr(j, "notes", "") or ""
+                    journal_debug.append(f"  [{jtime}] user={uname} notes={notes[:150]}")
+                    # 尝试多种方式获取 details
+                    details = []
+                    raw = getattr(j, "_data", {})
+                    if isinstance(raw, dict) and not raw.get("details"):
+                        # 打印 _data 的所有 key 帮助调试
+                        journal_debug.append(f"    _data keys: {list(raw.keys())[:10]}")
+                    details = raw.get("details", []) if isinstance(raw, dict) else []
+                    # 方式2: redminelib details 属性
+                    if not details:
+                        try:
+                            details = [dict(d) if hasattr(d, '__iter__') else str(d) for d in getattr(j, "details", [])]
+                        except Exception:
+                            pass
+                    for d in details:
+                        if isinstance(d, dict):
+                            name = d.get("name", d.get("property", "?"))
+                            journal_debug.append(
+                                f"    detail: {name} "
+                                f"old={d.get('old_value','?')} new={d.get('new_value','?')}"
+                            )
+                        else:
+                            journal_debug.append(f"    detail(raw): {d}")
+            except Exception as e:
+                journal_debug.append(f"--- Issue #{entry['issue_id']} 拉取失败: {e} ---")
+        journal_debug.append("")
+
         t_total = time.perf_counter() - t_total_start
         timing = {
             "filter": filter_elapsed,
@@ -308,16 +395,22 @@ class RedmineClient:
             "preclassify": round(t3 - t2, 2),
             "preclassify_new": len(result) - confirmed_by_journal,
             "preclassify_pending": len(need_journal_check),
+            "search_api": round(t_act_elapsed, 2),
+            "search_hit": len(search_issues),
+            "search_skipped": skipped_by_search,
+            "search_error": search_error,
+            "search_debug": search_debug,
             "journal": journal_elapsed,
             "journal_checked": len(need_journal_check),
             "journal_confirmed": confirmed_by_journal,
             "total": round(t_total, 2),
+            "journal_debug": journal_debug,
         }
         self._last_timing = timing
         print(
             f"  [计时] get_issues_by_date 总计: {t_total:.2f}s "
             f"(filter={filter_elapsed:.2f} + 预分类={t3 - t2:.2f} "
-            f"+ 活动API={t_act_elapsed:.2f} + journal={journal_elapsed:.2f})",
+            f"+ 搜索={t_act_elapsed:.2f} + journal={journal_elapsed:.2f})",
             file=sys.stderr,
         )
         return result
@@ -379,15 +472,17 @@ class RedmineClient:
                     continue
                 found = True
 
-                # 直接从原始 JSON 提取 status 变更，绕过 redminelib 封装
-                raw = getattr(journal, "_data", {})
-                for d in raw.get("details", []):
-                    if isinstance(d, dict):
-                        if d.get("name") == "status_id":
-                            val = d.get("new_value", "")
+                # 从 journal details 提取 status 变更
+                for d in getattr(journal, "details", []):
+                    try:
+                        name = getattr(d, "name", "")
+                        if name == "status_id":
+                            val = getattr(d, "new_value", "")
                             if val:
                                 status_override = str(val)
                                 break
+                    except Exception:
+                        continue
                 break
 
             if not found:
@@ -485,12 +580,14 @@ class RedmineClient:
         self,
         report_date: str | None = None,
         project_ids: list[int] | None = None,
+        skip_review: bool = False,
     ) -> DailyReport:
         """编排所有 API 调用，构建完整的 DailyReport 对象。
 
         Args:
             report_date: 报告日期 YYYY-MM-DD，None=今天。
             project_ids: 限定查询的项目 ID 列表，None=自动获取。
+            skip_review: True=跳过方案3（审核复核），大幅提速。
         """
         t_build_start = time.perf_counter()
         if report_date is None:
@@ -501,7 +598,10 @@ class RedmineClient:
         user_id = user_info["id"]
         auth_elapsed = time.perf_counter() - t_auth_start
 
-        raw_issues = self.get_issues_by_date(report_date, user_id, project_ids=project_ids)
+        raw_issues = self.get_issues_by_date(report_date, user_id,
+                                              project_ids=project_ids,
+                                              user_name=user_info["name"],
+                                              skip_review=skip_review)
         print(
             f"找到 {len(raw_issues)} 个 Issue（{report_date}）",
             file=sys.stderr,

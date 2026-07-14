@@ -26,3 +26,6 @@ requests_timeout: 30
 # - 手动指定：只查询列表中的项目，例如 [17, 23, 45]
 # 手动指定可以提速，适合 membership API 不可用或用户跨项目太多时进行限制
 # project_ids: [17, 23]
+
+# 跳过审核/复核（只查本人创建/经办的 Issue，大幅提速）
+skip_review: false

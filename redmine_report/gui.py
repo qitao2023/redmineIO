@@ -310,11 +310,6 @@ class RedmineReportApp(ctk.CTk):
         )
         self.eye_btn.grid(row=0, column=1, padx=(0, 2))
 
-        self.save_key_btn = ctk.CTkButton(
-            key_frame, text="💾", width=36, height=34,
-            command=self._save_config,
-        )
-        self.save_key_btn.grid(row=0, column=2)
         row += 1
 
         # ── 分隔线 ──
@@ -353,12 +348,11 @@ class RedmineReportApp(ctk.CTk):
         self.project_frame.grid_columnconfigure(0, weight=1)
         row += 1
 
-        # 项目操作按钮行: 全选 / 全不选 / 保存
+        # 项目操作按钮行: 全选 / 全不选
         proj_btn_row = ctk.CTkFrame(parent, fg_color="transparent")
         proj_btn_row.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
         proj_btn_row.grid_columnconfigure(0, weight=1)
         proj_btn_row.grid_columnconfigure(1, weight=1)
-        proj_btn_row.grid_columnconfigure(2, weight=1)
 
         self.proj_all_btn = ctk.CTkButton(
             proj_btn_row, text="全选", command=self._select_all_projects,
@@ -370,13 +364,7 @@ class RedmineReportApp(ctk.CTk):
             proj_btn_row, text="全不选", command=self._select_no_projects,
             height=28, font=ctk.CTkFont(size=11),
         )
-        self.proj_none_btn.grid(row=0, column=1, sticky="ew", padx=(1, 1))
-
-        self.proj_save_btn = ctk.CTkButton(
-            proj_btn_row, text="💾 保存", command=self._save_config,
-            height=28, font=ctk.CTkFont(size=11),
-        )
-        self.proj_save_btn.grid(row=0, column=2, sticky="ew", padx=(2, 0))
+        self.proj_none_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0))
         row += 1
 
         # ── 分隔线 ──
@@ -404,6 +392,25 @@ class RedmineReportApp(ctk.CTk):
             font=ctk.CTkFont(size=12),
         )
         self.perf_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        row += 1
+
+        # ── 审核复核开关 ──
+        self.skip_review_var = ctk.BooleanVar(value=False)
+        self.skip_review_cb = ctk.CTkCheckBox(
+            parent, text="⚡ 跳过审核复核（仅查本人Issue，大幅提速）",
+            variable=self.skip_review_var,
+            font=ctk.CTkFont(size=11),
+        )
+        self.skip_review_cb.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="w")
+        row += 1
+
+        # ── 保存设置 ──
+        self.save_settings_btn = ctk.CTkButton(
+            parent, text="💾 保存设置", command=self._save_config,
+            height=34, fg_color="#2563eb", hover_color="#1d4ed8",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.save_settings_btn.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew")
         row += 1
 
         # 存储：{project_id: (name, BooleanVar)}
@@ -523,7 +530,6 @@ class RedmineReportApp(ctk.CTk):
 
     def _auto_load_config(self):
         """启动时自动尝试加载配置。"""
-        # 先设默认值
         self.url_entry.delete(0, "end")
         self.url_entry.insert(0, self.DEFAULT_URL)
         self._project_ids: list[int] = []
@@ -537,6 +543,10 @@ class RedmineReportApp(ctk.CTk):
                 self.key_entry.delete(0, "end")
                 self.key_entry.insert(0, cfg.api_key)
             self._project_ids = cfg.project_ids or []
+            self.skip_review_var.set(cfg.skip_review)
+            # 自动加载项目列表到界面
+            if cfg.redmine_url and cfg.api_key:
+                self.after(800, self._fetch_project_list)
         except ConfigError:
             pass  # 没有配置文件也正常
 
@@ -562,6 +572,8 @@ class RedmineReportApp(ctk.CTk):
                 self.key_entry.delete(0, "end")
                 self.key_entry.insert(0, cfg.api_key)
             self._project_ids = cfg.project_ids or []
+            self.skip_review_var.set(cfg.skip_review)
+            self._fetch_project_list()
             self._set_status("配置已加载")
         except ConfigError as e:
             messagebox.showerror("配置错误", str(e))
@@ -585,6 +597,7 @@ class RedmineReportApp(ctk.CTk):
                 "timezone": "Asia/Shanghai",
                 "output_dir": "./reports",
                 "project_ids": selected_ids,
+                "skip_review": self.skip_review_var.get(),
             }
             config_path.write_text(
                 yaml.dump(data, allow_unicode=True, default_flow_style=False),
@@ -722,7 +735,6 @@ class RedmineReportApp(ctk.CTk):
         threading.Thread(target=do_test, daemon=True).start()
 
     def _on_test_success(self, msg: str):
-        self._save_config()  # 自动保存 Key，下次不用再输
         self.test_btn.configure(state="normal", text="🔍 测试连接")
         self._show_progress(False)
         self._set_status("连接测试通过 ✓ — Key 已保存")
@@ -791,7 +803,9 @@ class RedmineReportApp(ctk.CTk):
         # 5. 后台线程执行
         thread = threading.Thread(
             target=self._do_generate,
-            args=(url, api_key, report_date, selected_ids, self.other_text.get("1.0", "end").strip(), False),
+            args=(url, api_key, report_date, selected_ids,
+                  self.other_text.get("1.0", "end").strip(),
+                  self.skip_review_var.get(), False),
             daemon=True,
         )
         thread.start()
@@ -819,12 +833,17 @@ class RedmineReportApp(ctk.CTk):
 
         thread = threading.Thread(
             target=self._do_generate,
-            args=(url, api_key, report_date, selected_ids, self.other_text.get("1.0", "end").strip(), True),
+            args=(url, api_key, report_date, selected_ids,
+                  self.other_text.get("1.0", "end").strip(),
+                  self.skip_review_var.get(), True),
             daemon=True,
         )
         thread.start()
 
-    def _do_generate(self, url: str, api_key: str, report_date: str, project_ids: list[int] | None, custom_other: str = "", show_timing: bool = False):
+    def _do_generate(self, url: str, api_key: str, report_date: str,
+                     project_ids: list[int] | None,
+                     custom_other: str = "", skip_review: bool = False,
+                     show_timing: bool = False):
         """后台线程：实际执行 API 调用和日报生成。"""
         error_msg: str | None = None
         report = None
@@ -839,7 +858,8 @@ class RedmineReportApp(ctk.CTk):
             # 获取数据
             self._after_status(f"正在获取 {report_date} 的工作记录...")
             proj_ids = project_ids if project_ids else None
-            report = client.build_report_data(report_date, project_ids=proj_ids)
+            report = client.build_report_data(report_date, project_ids=proj_ids,
+                                               skip_review=skip_review)
 
             # 生成 Markdown
             self._after_status("正在生成日报...")
@@ -914,7 +934,7 @@ class RedmineReportApp(ctk.CTk):
                 f"认证:          {timing.get('auth', '?')}s",
                 f"filter查询:    {timing.get('filter', '?')}s  ({timing.get('filter_queries', '?')}次请求, {timing.get('filter_candidates', '?')}个候选)",
                 f"预分类:        {timing.get('preclassify', '?')}s  (新增{timing.get('preclassify_new', '?')} + 待验证{timing.get('preclassify_pending', '?')})",
-                f"活动API预筛:   {timing.get('activity_filter', '?')}s  (命中{timing.get('activity_hit', '?')}个, 筛掉{timing.get('activity_skipped', '?')}个无关){'  FAIL: '+timing.get('activity_error','') if timing.get('activity_error') else ''}",
+                f"搜索API预筛:   {timing.get('search_api', '?')}s  (命中{timing.get('search_hit', '?')}个, 筛掉{timing.get('search_skipped', '?')}个无关){'  FAIL: '+timing.get('search_error','') if timing.get('search_error') else ''}",
                 f"journal验证:   {timing.get('journal', '?')}s  (检查{timing.get('journal_checked', '?')}个, 确认{timing.get('journal_confirmed', '?')}个)",
                 f"─────────────────────────",
                 f"总耗时:        {timing.get('build_total', timing.get('total', '?'))}s",
@@ -926,6 +946,20 @@ class RedmineReportApp(ctk.CTk):
                 self.preview_text.insert("end", "\n")
                 self.preview_text.insert("end", f"──────── filter候选 Issue（{len(candidates)}个）────────\n")
                 for line in candidates[:200]:
+                    self.preview_text.insert("end", line + "\n")
+            # 搜索 API 调试信息
+            search_debug = timing.get("search_debug", "")
+            if search_debug:
+                self.preview_text.insert("end", "\n")
+                self.preview_text.insert("end", "──────── 搜索API原始返回 ────────\n")
+                for line in search_debug.split("\n")[:20]:
+                    self.preview_text.insert("end", line + "\n")
+            # journal 原始内容调试
+            journal_debug = timing.get("journal_debug", [])
+            if journal_debug:
+                self.preview_text.insert("end", "\n")
+                self.preview_text.insert("end", "──────── 已确认Issue的journal内容 ────────\n")
+                for line in journal_debug[:60]:
                     self.preview_text.insert("end", line + "\n")
 
         # 更新摘要
