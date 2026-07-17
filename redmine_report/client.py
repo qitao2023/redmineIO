@@ -198,6 +198,7 @@ class RedmineClient:
         project_ids: list[int] | None = None,
         user_name: str = "",
         skip_review: bool = False,
+        review_strict: bool = False,
         limit: int = 300,
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
@@ -208,6 +209,7 @@ class RedmineClient:
             project_ids: 限定查询的项目 ID 列表。为 None 时自动获取用户所属项目。
             user_name: 当前用户名（用于搜索 API 预筛）。
             skip_review: True=跳过方案3（不查审核复核），大幅提速。
+            review_strict: True=审核复核仅计入状态/指派变更，纯评论不算。
             limit: 单次查询返回上限（仅用于覆盖 Redmine 默认 25 条分页限制）。
         """
         # project_ids 为空时：方案3 回退到原来的全站查询（不额外调用 membership API）
@@ -333,8 +335,9 @@ class RedmineClient:
 
         # ═══ 阶段3: journal 验证 ═══
         result_before_journal = len(result)
-        self._check_journals_concurrent(
-            need_journal_check, user_id, report_date, verified, result
+        rejected = self._check_journals_concurrent(
+            need_journal_check, user_id, report_date, verified, result,
+            review_strict=review_strict,
         )
         t4 = time.perf_counter()
         journal_elapsed = t4 - t3
@@ -403,6 +406,7 @@ class RedmineClient:
             "journal": journal_elapsed,
             "journal_checked": len(need_journal_check),
             "journal_confirmed": confirmed_by_journal,
+            "journal_rejected": (rejected or []) if review_strict else [],
             "total": round(t_total, 2),
             "journal_debug": journal_debug,
         }
@@ -423,15 +427,21 @@ class RedmineClient:
         seen: set[int],
         result: list[dict[str, Any]],
         max_workers: int = 20,
+        review_strict: bool = False,
     ):
-        """并发检查 Issue 的 journal，20 线程 + 重试 1 次。"""
+        """并发检查 Issue 的 journal，20 线程 + 重试 1 次。
+
+        review_strict=True 时：仅计入状态或指派变更，纯评论忽略。
+        """
         if not issues:
-            return
+            return []
 
         t0 = time.perf_counter()
         total_fetched = 0
         total_failed = 0
+        rejected_debug: list[str] = []  # 被 review_strict 过滤的 Issue
         count_lock = threading.Lock()
+        debug_lock = threading.Lock()
 
         def _fetch_detailed(issue_id: int) -> tuple[Any, list] | None:
             for attempt in range(2):
@@ -445,7 +455,7 @@ class RedmineClient:
             return None
 
         def _check_one(issue):
-            """检查 journals，找用户当天最后一次改状态的记录。"""
+            """检查 journals，找用户当天最后一次改状态/指派的记录。"""
             nonlocal total_fetched, total_failed
             result_item = _fetch_detailed(issue.id)
             if result_item is None:
@@ -456,8 +466,9 @@ class RedmineClient:
                 total_fetched += 1
             detailed, journals = result_item
 
-            # 倒序找用户当天最后一条 journal
-            status_override = ""
+            # 倒序找用户当天所有 journal，汇总 status / assignee 变更
+            has_status_change = False
+            has_assignee_change = False
             found = False
             for journal in reversed(journals):
                 try:
@@ -470,25 +481,51 @@ class RedmineClient:
                 jd = self._to_beijing_date(getattr(journal, "created_on", None))
                 if jd != report_date:
                     continue
-                found = True
 
-                # 从 journal details 提取 status 变更
+                if not found:
+                    found = True
+
+                # 汇总所有 journal 的 status / assignee 变更
                 for d in getattr(journal, "details", []):
                     try:
-                        name = getattr(d, "name", "")
+                        dd = dict(d) if hasattr(d, '__iter__') else {}
+                        name = str(dd.get("name", "") if dd else getattr(d, "name", ""))
                         if name == "status_id":
-                            val = getattr(d, "new_value", "")
-                            if val:
-                                status_override = str(val)
-                                break
+                            has_status_change = True
+                        elif "assigned_to" in name:
+                            has_assignee_change = True
                     except Exception:
                         continue
-                break
+
+                # 已经找到了全部变更则提前退出
+                if has_status_change and has_assignee_change:
+                    break
 
             if not found:
                 return None
 
-            return self._extract_issue_data(detailed, status_override=status_override)
+            # review_strict 模式：状态和指派都没变 → 跳过
+            if review_strict and not has_status_change and not has_assignee_change:
+                # 记录被过滤的原因，方便排错
+                all_names = []
+                for j in journals:
+                    for d in getattr(j, "details", []):
+                        try:
+                            dd = dict(d) if hasattr(d, '__iter__') else {}
+                            if dd:
+                                all_names.append(str(dd.get("name", "?")))
+                            else:
+                                all_names.append(str(getattr(d, "name", "?")))
+                        except Exception:
+                            pass
+                with debug_lock:
+                    rejected_debug.append(
+                        f"#{issue.id} 过滤: 无status/assignee变更 "
+                        f"(details字段: {', '.join(all_names[:10]) if all_names else '空'})"
+                    )
+                return None
+
+            return self._extract_issue_data(detailed)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_check_one, iss): iss for iss in issues}
@@ -508,6 +545,7 @@ class RedmineClient:
             f"成功{total_fetched}/失败{total_failed}，均{avg_per:.2f}s/个）",
             file=sys.stderr,
         )
+        return rejected_debug
 
     def _extract_issue_data(self, issue: Any, status_override: str = "") -> dict[str, Any]:
         """从 Issue 资源提取结构化数据。
@@ -581,6 +619,7 @@ class RedmineClient:
         report_date: str | None = None,
         project_ids: list[int] | None = None,
         skip_review: bool = False,
+        review_strict: bool = False,
     ) -> DailyReport:
         """编排所有 API 调用，构建完整的 DailyReport 对象。
 
@@ -588,6 +627,7 @@ class RedmineClient:
             report_date: 报告日期 YYYY-MM-DD，None=今天。
             project_ids: 限定查询的项目 ID 列表，None=自动获取。
             skip_review: True=跳过方案3（审核复核），大幅提速。
+            review_strict: True=审核复核仅计入状态/指派变更，纯评论不算。
         """
         t_build_start = time.perf_counter()
         if report_date is None:
@@ -601,7 +641,8 @@ class RedmineClient:
         raw_issues = self.get_issues_by_date(report_date, user_id,
                                               project_ids=project_ids,
                                               user_name=user_info["name"],
-                                              skip_review=skip_review)
+                                              skip_review=skip_review,
+                                              review_strict=review_strict)
         print(
             f"找到 {len(raw_issues)} 个 Issue（{report_date}）",
             file=sys.stderr,

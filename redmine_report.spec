@@ -38,7 +38,6 @@ hidden_imports = [
 
 # ── 需要收集的数据文件 ──
 datas = [
-    (str(ROOT / "config.yaml"), "."),
 ]
 
 # 收集 customtkinter 的主题资源

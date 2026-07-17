@@ -50,6 +50,7 @@ class RedmineReportApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         # 状态
+        self._init_complete = False  # 初始化完成前禁止自动保存
         self._report_content: str | None = None
         self._report_date: str = ""
         self._client: RedmineClient | None = None
@@ -110,11 +111,13 @@ class RedmineReportApp(ctk.CTk):
         content_frame.grid(row=1, column=0, padx=4, pady=(0, 4), sticky="nsew")
         content_frame.grid_columnconfigure(0, weight=1)
         content_frame.grid_rowconfigure(0, weight=1)
+        content_frame.grid_propagate(False)
 
         # 两个内容 frame 叠放在同一位置
         self._tab_gen = ctk.CTkFrame(content_frame, fg_color="transparent")
         self._tab_gen.grid(row=0, column=0, sticky="nsew")
         self._tab_gen.grid_columnconfigure(0, weight=1)
+        self._tab_gen.grid_propagate(False)  # 强制撑满父容器，否则子控件权重不生效
 
         self._tab_cfg = ctk.CTkFrame(content_frame, fg_color="transparent")
         self._tab_cfg.grid(row=0, column=0, sticky="nsew")
@@ -133,6 +136,9 @@ class RedmineReportApp(ctk.CTk):
     def _switch_tab(self, tab: str):
         """切换 Tab 显示。"""
         if tab == "gen":
+            # 从设置页切走时自动保存（跳过初始化阶段）
+            if getattr(self, '_init_complete', False):
+                self._auto_save()
             self._tab_gen.grid()
             self._tab_cfg.grid_remove()
             self._tab_gen_btn.configure(fg_color="#2563eb", hover_color="#1d4ed8")
@@ -148,14 +154,15 @@ class RedmineReportApp(ctk.CTk):
         parent.grid_columnconfigure(0, weight=1)
         row = 0
 
-        # ── 报告日期 ──
-        ctk.CTkLabel(parent, text="报告日期", anchor="w").grid(
-            row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="w"
+        # ── 报告日期 + 下班时间（合并为紧凑两行）──
+        ctk.CTkLabel(parent, text="报告日期", anchor="w",
+                     font=ctk.CTkFont(size=12)).grid(
+            row=row, column=0, padx=PAD_X, pady=(PAD_Y, 3), sticky="w"
         )
         row += 1
 
         date_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        date_frame.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
+        date_frame.grid(row=row, column=0, padx=PAD_X, pady=(0, 4), sticky="ew")
         date_frame.grid_columnconfigure(0, weight=1)
         date_frame.grid_columnconfigure(1, weight=0)
 
@@ -167,26 +174,27 @@ class RedmineReportApp(ctk.CTk):
         self.date_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self.today_btn = ctk.CTkButton(
-            date_frame, text="今天", width=50, height=34,
+            date_frame, text="今天", width=46, height=34,
             command=self._set_today,
         )
         self.today_btn.grid(row=0, column=1, padx=(0, 2))
 
         self.yesterday_btn = ctk.CTkButton(
-            date_frame, text="昨天", width=50, height=34,
+            date_frame, text="昨天", width=46, height=34,
             command=self._set_yesterday,
         )
         self.yesterday_btn.grid(row=0, column=2)
         row += 1
 
         # ── 下班时间 ──
-        ctk.CTkLabel(parent, text="下班时间", anchor="w").grid(
-            row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="w"
+        ctk.CTkLabel(parent, text="下班时间", anchor="w",
+                     font=ctk.CTkFont(size=12)).grid(
+            row=row, column=0, padx=PAD_X, pady=(4, 3), sticky="w"
         )
         row += 1
 
         time_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        time_frame.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
+        time_frame.grid(row=row, column=0, padx=PAD_X, pady=(0, 4), sticky="ew")
         time_frame.grid_columnconfigure(0, weight=1)
         time_frame.grid_columnconfigure(1, weight=0)
 
@@ -198,68 +206,66 @@ class RedmineReportApp(ctk.CTk):
         self.time_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self.now_btn = ctk.CTkButton(
-            time_frame, text="现在", width=50, height=34,
+            time_frame, text="现在", width=46, height=34,
             command=self._set_time_now,
         )
         self.now_btn.grid(row=0, column=1, padx=(0, 2))
 
         self.time_1730_btn = ctk.CTkButton(
-            time_frame, text="17:30", width=50, height=34,
+            time_frame, text="17:30", width=46, height=34,
             command=lambda: self._set_time("17:30"),
         )
         self.time_1730_btn.grid(row=0, column=2, padx=(0, 2))
 
         self.time_2030_btn = ctk.CTkButton(
-            time_frame, text="20:30", width=50, height=34,
+            time_frame, text="20:30", width=46, height=34,
             command=lambda: self._set_time("20:30"),
         )
         self.time_2030_btn.grid(row=0, column=3)
         row += 1
 
-        # ── 分隔线 ──
-        ctk.CTkFrame(parent, height=2, fg_color=("gray70", "gray30")).grid(
-            row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew"
-        )
-        row += 1
-
         # ── 生成 + 复制 ──
         gen_row = ctk.CTkFrame(parent, fg_color="transparent")
-        gen_row.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew")
+        gen_row.grid(row=row, column=0, padx=PAD_X, pady=(4, 2), sticky="ew")
         gen_row.grid_columnconfigure(0, weight=2)
         gen_row.grid_columnconfigure(1, weight=1)
 
         self.generate_btn = ctk.CTkButton(
             gen_row, text="🚀 生成日报", command=self._generate_report,
-            height=40, fg_color="#2563eb", hover_color="#1d4ed8",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            height=36, fg_color="#2563eb", hover_color="#1d4ed8",
+            font=ctk.CTkFont(size=13, weight="bold"),
         )
         self.generate_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
         self.copy_btn = ctk.CTkButton(
             gen_row, text="📋 复制", command=self._copy_report,
-            height=40, state="disabled",
+            height=36, state="disabled",
         )
         self.copy_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
         row += 1
 
-        # ── 其他补充输入 ──
-        ctk.CTkLabel(parent, text="其他补充（自定义内容）", anchor="w",
-                     font=ctk.CTkFont(size=11)).grid(
-            row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="w"
-        )
-        row += 1
-        self.other_text = ctk.CTkTextbox(parent, height=160, wrap="word",
-                                          font=ctk.CTkFont(size=12))
-        self.other_text.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
-        row += 1
+        # ── 其他补充（标签 + 摘要同一行）──
+        label_row = ctk.CTkFrame(parent, fg_color="transparent")
+        label_row.grid(row=row, column=0, padx=PAD_X, pady=(2, 3), sticky="ew")
+        label_row.grid_columnconfigure(0, weight=1)
+        label_row.grid_columnconfigure(1, weight=0)
 
-        # ── 摘要信息 ──
+        ctk.CTkLabel(label_row, text="其他补充（自定义内容）", anchor="w",
+                     font=ctk.CTkFont(size=12)).grid(row=0, column=0, sticky="w")
+
         self.summary_label = ctk.CTkLabel(
-            parent, text="", anchor="w", justify="left",
+            label_row, text="", anchor="e", justify="right",
             font=ctk.CTkFont(size=11),
             text_color=("gray50", "gray60"),
         )
-        self.summary_label.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew")
+        self.summary_label.grid(row=0, column=1, sticky="e")
+        row += 1
+
+        # ── 文本框（拉伸到底）──
+        self.other_text = ctk.CTkTextbox(parent, wrap="word",
+                                          font=ctk.CTkFont(size=12))
+        self.other_text.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="nsew")
+        parent.grid_rowconfigure(row, weight=1)  # 文本框行纵向拉伸
 
     def _build_tab_settings(self, parent):
         """构建「设置」Tab。"""
@@ -267,12 +273,13 @@ class RedmineReportApp(ctk.CTk):
         row = 0
 
         # ── 服务器地址 ──
-        ctk.CTkLabel(parent, text="服务器地址", anchor="w").grid(
+        ctk.CTkLabel(parent, text="服务器地址", anchor="w",
+                     font=ctk.CTkFont(size=12)).grid(
             row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="w"
         )
         row += 1
         self.url_entry = ctk.CTkEntry(
-            parent, placeholder_text="http://192.168.0.83:8181/redmine/", height=34,
+            parent, placeholder_text="http://192.168.0.83:8181/redmine/", height=40,
         )
         self.url_entry.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
         row += 1
@@ -280,13 +287,14 @@ class RedmineReportApp(ctk.CTk):
         # ── API Key ──
         key_label_frame = ctk.CTkFrame(parent, fg_color="transparent")
         key_label_frame.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="ew")
-        ctk.CTkLabel(key_label_frame, text="API Key", anchor="w").grid(
+        ctk.CTkLabel(key_label_frame, text="API Key", anchor="w",
+                     font=ctk.CTkFont(size=12)).grid(
             row=0, column=0, sticky="w"
         )
         self.key_help_btn = ctk.CTkButton(
             key_label_frame, text="?", width=22, height=22, corner_radius=11,
             fg_color=("gray65", "gray50"), hover_color=("gray55", "gray40"),
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=ctk.CTkFont(size=12, weight="bold"),
             command=self._show_key_help,
         )
         self.key_help_btn.grid(row=0, column=1, padx=(4, 0), sticky="w")
@@ -299,13 +307,13 @@ class RedmineReportApp(ctk.CTk):
         key_frame.grid_columnconfigure(2, weight=0)
 
         self.key_entry = ctk.CTkEntry(
-            key_frame, placeholder_text="输入 API 访问密钥", show="•", height=34,
+            key_frame, placeholder_text="输入 API 访问密钥", show="•", height=40,
         )
         self.key_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self._key_visible = False
         self.eye_btn = ctk.CTkButton(
-            key_frame, text="👁", width=36, height=34,
+            key_frame, text="👁", width=36, height=40,
             command=self._toggle_key_visibility,
         )
         self.eye_btn.grid(row=0, column=1, padx=(0, 2))
@@ -314,13 +322,13 @@ class RedmineReportApp(ctk.CTk):
 
         # ── 分隔线 ──
         ctk.CTkFrame(parent, height=2, fg_color=("gray70", "gray30")).grid(
-            row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew"
+            row=row, column=0, padx=PAD_X, pady=(4, 4), sticky="ew"
         )
         row += 1
 
         # ── 跟踪项目 ──
         proj_title_row = ctk.CTkFrame(parent, fg_color="transparent")
-        proj_title_row.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="ew")
+        proj_title_row.grid(row=row, column=0, padx=PAD_X, pady=(4, 0), sticky="ew")
         proj_title_row.grid_columnconfigure(0, weight=1)
         proj_title_row.grid_columnconfigure(1, weight=0)
 
@@ -333,7 +341,7 @@ class RedmineReportApp(ctk.CTk):
             proj_title_row, text="🔄 获取列表",
             command=self._fetch_project_list,
             height=26, width=90,
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=12),
             fg_color="#2563eb", hover_color="#1d4ed8",
         )
         self.proj_fetch_btn.grid(row=0, column=1, sticky="e")
@@ -341,7 +349,7 @@ class RedmineReportApp(ctk.CTk):
 
         # 项目复选框容器（可滚动）
         self.project_frame = ctk.CTkScrollableFrame(
-            parent, height=150,
+            parent, height=100,
             fg_color=("gray95", "gray15"), corner_radius=6,
         )
         self.project_frame.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
@@ -350,68 +358,97 @@ class RedmineReportApp(ctk.CTk):
 
         # 项目操作按钮行: 全选 / 全不选
         proj_btn_row = ctk.CTkFrame(parent, fg_color="transparent")
-        proj_btn_row.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
+        proj_btn_row.grid(row=row, column=0, padx=PAD_X, pady=(0, 4), sticky="ew")
         proj_btn_row.grid_columnconfigure(0, weight=1)
         proj_btn_row.grid_columnconfigure(1, weight=1)
 
         self.proj_all_btn = ctk.CTkButton(
             proj_btn_row, text="全选", command=self._select_all_projects,
-            height=28, font=ctk.CTkFont(size=11),
+            height=28, font=ctk.CTkFont(size=12),
         )
         self.proj_all_btn.grid(row=0, column=0, sticky="ew", padx=(0, 2))
 
         self.proj_none_btn = ctk.CTkButton(
             proj_btn_row, text="全不选", command=self._select_no_projects,
-            height=28, font=ctk.CTkFont(size=11),
+            height=28, font=ctk.CTkFont(size=12),
         )
         self.proj_none_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0))
         row += 1
 
-        # ── 分隔线 ──
+        # ── 审核复核开关 ──
         ctk.CTkFrame(parent, height=2, fg_color=("gray70", "gray30")).grid(
-            row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew"
+            row=row, column=0, padx=PAD_X, pady=(4, 4), sticky="ew"
         )
+        row += 1
+
+        self.skip_review_var = ctk.BooleanVar(value=False)
+        self.skip_review_cb = ctk.CTkCheckBox(
+            parent, text="⚡ 跳过审核复核（仅查本人Issue，大幅提速）",
+            variable=self.skip_review_var,
+            font=ctk.CTkFont(size=13),
+            checkbox_width=20, checkbox_height=20,
+        )
+        self.skip_review_cb.grid(row=row, column=0, padx=PAD_X, pady=(4, 0), sticky="w")
+        row += 1
+
+        # ── 审核复核严格模式 ──
+        self.review_strict_var = ctk.BooleanVar(value=True)
+        self.review_strict_cb = ctk.CTkCheckBox(
+            parent, text="🔍 审核复核仅计入状态/指派变更（纯评论不算）",
+            variable=self.review_strict_var,
+            font=ctk.CTkFont(size=13),
+            checkbox_width=20, checkbox_height=20,
+        )
+        self.review_strict_cb.grid(row=row, column=0, padx=PAD_X, pady=(4, 0), sticky="w")
         row += 1
 
         # ── 测试连接 + 耗时分析 ──
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_row.grid(row=row, column=0, padx=PAD_X, pady=(0, PAD_Y), sticky="ew")
+        btn_row.grid(row=row, column=0, padx=PAD_X, pady=(4, 4), sticky="ew")
         btn_row.grid_columnconfigure(0, weight=1)
         btn_row.grid_columnconfigure(1, weight=1)
 
         self.test_btn = ctk.CTkButton(
             btn_row, text="🔍 测试连接", command=self._test_connection,
-            height=34, fg_color="#6b7280", hover_color="#4b5563",
+            height=30, fg_color="#2563eb", hover_color="#1d4ed8",
+            font=ctk.CTkFont(size=12),
         )
         self.test_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
         self.perf_btn = ctk.CTkButton(
             btn_row, text="⏱ 耗时分析", command=self._analyze_performance,
-            height=34, fg_color="transparent", border_width=1,
-            border_color="#f59e0b", text_color="#f59e0b",
+            height=30, fg_color="#2563eb", hover_color="#1d4ed8",
             font=ctk.CTkFont(size=12),
         )
         self.perf_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
         row += 1
 
-        # ── 审核复核开关 ──
-        self.skip_review_var = ctk.BooleanVar(value=False)
-        self.skip_review_cb = ctk.CTkCheckBox(
-            parent, text="⚡ 跳过审核复核（仅查本人Issue，大幅提速）",
-            variable=self.skip_review_var,
-            font=ctk.CTkFont(size=11),
+        # ── 保存 + 重置（同行）──
+        btn_row2 = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_row2.grid(row=row, column=0, padx=PAD_X, pady=(4, 4), sticky="ew")
+        btn_row2.grid_columnconfigure(0, weight=1)
+        btn_row2.grid_columnconfigure(1, weight=1)
+
+        self.save_settings_btn = ctk.CTkButton(
+            btn_row2, text="💾 保存设置", command=self._do_auto_save,
+            height=30, fg_color="#2563eb", hover_color="#1d4ed8",
+            font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.skip_review_cb.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, 0), sticky="w")
+        self.save_settings_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
+        self.reset_btn = ctk.CTkButton(
+            btn_row2, text="🗑 重置", command=self._reset_settings,
+            height=30, fg_color="#2563eb", hover_color="#1d4ed8",
+            font=ctk.CTkFont(size=12),
+        )
+        self.reset_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
         row += 1
 
-        # ── 保存设置 ──
-        self.save_settings_btn = ctk.CTkButton(
-            parent, text="💾 保存设置", command=self._save_config,
-            height=34, fg_color="#2563eb", hover_color="#1d4ed8",
-            font=ctk.CTkFont(size=13, weight="bold"),
-        )
-        self.save_settings_btn.grid(row=row, column=0, padx=PAD_X, pady=(PAD_Y, PAD_Y), sticky="ew")
-        row += 1
+        # ── 自动保存：输入框失焦 / 复选框切换时自动写入 config.yaml ──
+        self.url_entry.bind("<FocusOut>", lambda e: self._auto_save())
+        self.key_entry.bind("<FocusOut>", lambda e: self._auto_save())
+        self.skip_review_var.trace_add("write", lambda *_: self._auto_save())
+        self.review_strict_var.trace_add("write", lambda *_: self._auto_save())
 
         # 存储：{project_id: (name, BooleanVar)}
         self._project_vars: dict[int, tuple[str, ctk.BooleanVar]] = {}
@@ -529,26 +566,46 @@ class RedmineReportApp(ctk.CTk):
     DEFAULT_URL = "http://192.168.0.83:8181/redmine/"
 
     def _auto_load_config(self):
-        """启动时自动尝试加载配置。"""
+        """启动时自动加载设置。"""
         self.url_entry.delete(0, "end")
         self.url_entry.insert(0, self.DEFAULT_URL)
         self._project_ids: list[int] = []
 
         try:
             cfg = load_config()
+            loaded = []
             if cfg.redmine_url:
                 self.url_entry.delete(0, "end")
                 self.url_entry.insert(0, cfg.redmine_url)
+                loaded.append("URL")
             if cfg.api_key:
                 self.key_entry.delete(0, "end")
                 self.key_entry.insert(0, cfg.api_key)
+                loaded.append("Key")
             self._project_ids = cfg.project_ids or []
+            if self._project_ids:
+                loaded.append(f"{len(self._project_ids)}个项目")
             self.skip_review_var.set(cfg.skip_review)
-            # 自动加载项目列表到界面
-            if cfg.redmine_url and cfg.api_key:
-                self.after(800, self._fetch_project_list)
+            self.review_strict_var.set(cfg.review_strict)
+            # 从保存的项目名直接还原列表（无需联网）
+            saved_names = cfg.data.get("project_names", {})
+            if saved_names:
+                all_projects = [
+                    {"id": int(pid), "name": name}
+                    for pid, name in saved_names.items()
+                ]
+                all_projects.sort(key=lambda p: p["name"])
+                self._populate_project_list(all_projects, self._project_ids)
+            if loaded:
+                self._set_status(f"已加载设置: {', '.join(loaded)}")
+            else:
+                self._set_status("设置文件为空，请填写服务器地址和 API Key")
         except ConfigError:
-            pass  # 没有配置文件也正常
+            self._set_status("首次使用，请填写服务器地址和 API Key")
+        except Exception as e:
+            self._set_status(f"设置加载失败: {e}")
+        finally:
+            self._init_complete = True
 
     def _load_config_file(self):
         """手动加载配置文件。"""
@@ -573,48 +630,100 @@ class RedmineReportApp(ctk.CTk):
                 self.key_entry.insert(0, cfg.api_key)
             self._project_ids = cfg.project_ids or []
             self.skip_review_var.set(cfg.skip_review)
+            self.review_strict_var.set(cfg.review_strict)
             self._fetch_project_list()
             self._set_status("配置已加载")
         except ConfigError as e:
             messagebox.showerror("配置错误", str(e))
 
+    def _reset_settings(self):
+        """清除所有设置，恢复到初始状态。"""
+        if not messagebox.askyesno(
+            "确认重置",
+            "将清除服务器地址、API Key 和项目选择，\n恢复到初始状态。\n\n确定要重置吗？",
+        ):
+            return
+
+        # 删除配置文件
+        config_path = Path.home() / ".redmine_report" / "config.yaml"
+        try:
+            config_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        # 清空 UI
+        self.url_entry.delete(0, "end")
+        self.url_entry.insert(0, self.DEFAULT_URL)
+        self.key_entry.delete(0, "end")
+        self.skip_review_var.set(False)
+        self.review_strict_var.set(True)
+        self._project_ids = []
+
+        # 清空项目列表
+        for w in self._project_labels:
+            w.destroy()
+        self._project_labels.clear()
+        self._project_vars.clear()
+
+        self._set_status("设置已重置，请重新配置")
+
+    def _auto_save(self, *args):
+        """延迟自动保存（500ms 防抖，避免频繁写入）。"""
+        if hasattr(self, '_auto_save_id') and self._auto_save_id:
+            self.after_cancel(self._auto_save_id)
+        self._auto_save_id = self.after(500, self._do_auto_save)
+
+    def _do_auto_save(self):
+        """执行自动保存。"""
+        self._save_config()
+        self._set_status("设置已自动保存 ✓")
+
     def _save_config(self):
-        """将当前 URL 和 Key 保存到 exe 同目录的 config.yaml。"""
+        """将当前设置保存到用户目录（不污染 exe 所在目录）。"""
         try:
             import sys
             import yaml
 
-            # 保存到 exe 所在目录（打包后）或当前目录（源码运行）
-            if getattr(sys, "frozen", False):
-                config_path = Path(sys.executable).parent / "config.yaml"
-            else:
-                config_path = Path("config.yaml")
+            # 统一保存到用户 home 目录，打包前后路径一致
+            config_dir = Path.home() / ".redmine_report"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config_path = config_dir / "config.yaml"
 
             selected_ids = self._get_selected_project_ids()
+            # 把当前加载的所有项目名也存下来（ID → 名称），下次还原直接用
+            all_projects = {
+                str(pid): name for pid, (name, var) in self._project_vars.items()
+            }
             data = {
                 "redmine_url": self.url_entry.get().strip(),
                 "api_key": self.key_entry.get().strip(),
                 "timezone": "Asia/Shanghai",
                 "output_dir": "./reports",
                 "project_ids": selected_ids,
+                "project_names": all_projects,
                 "skip_review": self.skip_review_var.get(),
+                "review_strict": self.review_strict_var.get(),
             }
             config_path.write_text(
                 yaml.dump(data, allow_unicode=True, default_flow_style=False),
                 encoding="utf-8",
             )
-            self._set_status(f"Key 已保存到 {config_path}")
-        except Exception:
-            pass  # 保存失败不影响主流程
+            self._set_status(f"设置已保存 ✓")
+        except Exception as e:
+            self._set_status(f"保存失败: {e}")
 
     # ── 项目选择 ────────────────────────────────────
 
     def _get_selected_project_ids(self) -> list[int]:
-        """从复选框读取当前勾选的项目 ID 列表。"""
+        """从复选框读取当前勾选的项目 ID 列表。
+        如果项目列表尚未加载，回退到已保存的 project_ids，避免空覆盖。
+        """
         ids: list[int] = []
         for pid, (name, var) in self._project_vars.items():
             if var.get():
                 ids.append(pid)
+        if not ids and not self._project_vars:
+            return list(self._project_ids) if self._project_ids else []
         return ids
 
     def _populate_project_list(self, all_projects: list[dict], selected_ids: list[int]) -> None:
@@ -637,7 +746,9 @@ class RedmineReportApp(ctk.CTk):
                 self.project_frame,
                 text=name,
                 variable=var,
-                font=ctk.CTkFont(size=11),
+                command=self._auto_save,
+                font=ctk.CTkFont(size=12),
+                checkbox_width=20, checkbox_height=20,
             )
             cb.grid(row=row, column=0, padx=4, pady=1, sticky="w")
             self._project_labels.append(cb)
@@ -645,7 +756,7 @@ class RedmineReportApp(ctk.CTk):
             row += 1
 
     def _fetch_project_list(self):
-        """从 Redmine API 拉取项目列表并刷新界面（用户手动触发）。"""
+        """从 Redmine API 拉取项目列表（后台线程，不阻塞 UI）。"""
         url = self.url_entry.get().strip()
         api_key = self.key_entry.get().strip()
         if not url or not api_key:
@@ -655,31 +766,42 @@ class RedmineReportApp(ctk.CTk):
         self.proj_fetch_btn.configure(state="disabled", text="⏳ 获取中...")
         self._set_status("正在从服务器获取项目列表...")
 
-        try:
-            client = RedmineClient(url=url, api_key=api_key)
-            user = client.authenticate()
-            all_projects = client.list_projects()
-            all_projects.sort(key=lambda p: p.get("name", ""))
-        except Exception as e:
-            self._set_status(f"获取失败: {str(e)[:80]}")
-            self.proj_fetch_btn.configure(state="normal", text="🔄 获取列表")
-            return
+        def _do_fetch():
+            try:
+                client = RedmineClient(url=url, api_key=api_key)
+                user = client.authenticate()
+                all_projects = client.list_projects()
+                all_projects.sort(key=lambda p: p.get("name", ""))
+                self.after(0, lambda: self._on_projects_fetched(all_projects))
+            except Exception as e:
+                self.after(0, lambda: self._on_projects_fetch_error(str(e)))
 
+        threading.Thread(target=_do_fetch, daemon=True).start()
+
+    def _on_projects_fetched(self, all_projects: list[dict]):
+        """项目列表获取成功回调。"""
         self._populate_project_list(all_projects, self._project_ids)
         self.proj_fetch_btn.configure(state="normal", text="🔄 获取列表")
         self._set_status(
             f"已加载 {len(all_projects)} 个项目（勾选 {len(self._get_selected_project_ids())} 个）"
         )
 
+    def _on_projects_fetch_error(self, error: str):
+        """项目列表获取失败回调。"""
+        self.proj_fetch_btn.configure(state="normal", text="🔄 获取列表")
+        self._set_status(f"获取失败: {error[:80]}")
+
     def _select_all_projects(self):
         """全选所有项目。"""
         for pid, (name, var) in self._project_vars.items():
             var.set(True)
+        self._auto_save()
 
     def _select_no_projects(self):
         """取消全选。"""
         for pid, (name, var) in self._project_vars.items():
             var.set(False)
+        self._auto_save()
 
     def _test_connection(self):
         """测试 Redmine 连接：验证 URL + API Key。"""
@@ -805,7 +927,7 @@ class RedmineReportApp(ctk.CTk):
             target=self._do_generate,
             args=(url, api_key, report_date, selected_ids,
                   self.other_text.get("1.0", "end").strip(),
-                  self.skip_review_var.get(), False),
+                  self.skip_review_var.get(), self.review_strict_var.get(), False),
             daemon=True,
         )
         thread.start()
@@ -835,7 +957,7 @@ class RedmineReportApp(ctk.CTk):
             target=self._do_generate,
             args=(url, api_key, report_date, selected_ids,
                   self.other_text.get("1.0", "end").strip(),
-                  self.skip_review_var.get(), True),
+                  self.skip_review_var.get(), self.review_strict_var.get(), True),
             daemon=True,
         )
         thread.start()
@@ -843,6 +965,7 @@ class RedmineReportApp(ctk.CTk):
     def _do_generate(self, url: str, api_key: str, report_date: str,
                      project_ids: list[int] | None,
                      custom_other: str = "", skip_review: bool = False,
+                     review_strict: bool = False,
                      show_timing: bool = False):
         """后台线程：实际执行 API 调用和日报生成。"""
         error_msg: str | None = None
@@ -859,7 +982,8 @@ class RedmineReportApp(ctk.CTk):
             self._after_status(f"正在获取 {report_date} 的工作记录...")
             proj_ids = project_ids if project_ids else None
             report = client.build_report_data(report_date, project_ids=proj_ids,
-                                               skip_review=skip_review)
+                                               skip_review=skip_review,
+                                               review_strict=review_strict)
 
             # 生成 Markdown
             self._after_status("正在生成日报...")
@@ -953,6 +1077,13 @@ class RedmineReportApp(ctk.CTk):
                 self.preview_text.insert("end", "\n")
                 self.preview_text.insert("end", "──────── 搜索API原始返回 ────────\n")
                 for line in search_debug.split("\n")[:20]:
+                    self.preview_text.insert("end", line + "\n")
+            # review_strict 过滤日志
+            rejected = timing.get("journal_rejected", [])
+            if rejected:
+                self.preview_text.insert("end", "\n")
+                self.preview_text.insert("end", f"──────── review_strict 过滤（{len(rejected)}个）────────\n")
+                for line in rejected[:50]:
                     self.preview_text.insert("end", line + "\n")
             # journal 原始内容调试
             journal_debug = timing.get("journal_debug", [])

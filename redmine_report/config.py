@@ -37,12 +37,13 @@ class Config:
     @classmethod
     def _search_paths(cls) -> list[Path]:
         paths = []
-        # 外部配置优先（用户保存的 Key 应覆盖内置配置）
+        # 用户设置目录最优先（auto-save 写这里）
+        paths.append(Path.home() / ".redmine_report" / "config.yaml")
+        # 兼容旧版：exe 同目录
         if getattr(sys, "frozen", False):
             paths.append(Path(sys.executable).parent / "config.yaml")
         paths.extend([
             Path("config.yaml"),
-            Path.home() / ".redmine_report" / "config.yaml",
             Path("/etc/redmine_report/config.yaml"),
         ])
         # 内置配置兜底
@@ -94,6 +95,7 @@ class Config:
             "requests_timeout": 30,
             "project_ids": [],  # 手动指定项目 ID 列表，空列表=自动获取
             "skip_review": False,  # True=跳过审核复核，只查本人创建/经办的 Issue
+            "review_strict": True,  # True=审核复核仅计入状态/指派变更，纯评论不算
         }
 
     def _find_config(self) -> Path | None:
@@ -130,11 +132,17 @@ class Config:
                 self.data["project_ids"] = rp["project_ids"]
             if "skip_review" in rp:
                 self.data["skip_review"] = rp["skip_review"]
+            if "review_strict" in rp:
+                self.data["review_strict"] = rp["review_strict"]
 
         # 也支持顶层平铺字段
-        for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids", "skip_review"):
+        for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids", "skip_review", "review_strict"):
             if key in raw and raw[key]:
                 self.data[key] = raw[key]
+
+        # 项目名称映射（用于离线还原列表）
+        if "project_names" in raw:
+            self.data["project_names"] = raw["project_names"]
 
     def _apply_env_overrides(self) -> None:
         env_map = {
@@ -193,6 +201,11 @@ class Config:
     def skip_review(self) -> bool:
         """是否跳过审核复核（只查本人创建/经办的 Issue）。"""
         return bool(self.data.get("skip_review", False))
+
+    @property
+    def review_strict(self) -> bool:
+        """审核复核是否仅计入状态/指派变更（纯评论不算）。"""
+        return bool(self.data.get("review_strict", False))
 
 
 def load_config(
