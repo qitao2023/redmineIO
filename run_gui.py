@@ -12,7 +12,7 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
-from redmine_report.gui import run_gui
+from redmine_report.gui_webview import run_gui
 
 if __name__ == "__main__":
     run_gui()

@@ -22,16 +22,28 @@ if errorlevel 1 (
 )
 
 REM 检查依赖
-python -c "import customtkinter" >nul 2>&1
+python -c "import flask" >nul 2>&1
 if errorlevel 1 (
-    echo [信息] 正在安装 customtkinter...
-    pip install customtkinter
+    echo [信息] 正在安装 flask...
+    pip install flask
+)
+
+python -c "import webview" >nul 2>&1
+if errorlevel 1 (
+    echo [信息] 正在安装 pywebview...
+    pip install pywebview
 )
 
 python -c "import redminelib" >nul 2>&1
 if errorlevel 1 (
     echo [信息] 正在安装 python-redmine...
     pip install python-redmine
+)
+
+python -c "import win32clipboard" >nul 2>&1
+if errorlevel 1 (
+    echo [信息] 正在安装 pywin32...
+    pip install pywin32
 )
 
 echo [构建] 写入构建时间...

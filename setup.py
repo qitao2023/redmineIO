@@ -13,6 +13,9 @@ setup(
         "click>=8.0.0",
         "python-redmine>=2.5.0",
         "PyYAML>=6.0",
+        "pywebview>=5.0",
+        "flask>=3.0",
+        "pywin32>=305",
     ],
     entry_points={
         "console_scripts": [

@@ -1,0 +1,1149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redmine 日报生成工具</title>
+<style>
+/* ═══════════════════════════════════════════════════════
+   CSS Variables & Design System
+   ═══════════════════════════════════════════════════════ */
+:root {
+  --bg-root: #f1f5f9;
+  --bg-card: #ffffff;
+  --bg-input: #f8fafc;
+  --bg-hover: #f1f5f9;
+  --bg-active: #e2e8f0;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --text-inverse: #ffffff;
+  --border: #e2e8f0;
+  --border-focus: #3b82f6;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-light: #eff6ff;
+  --success: #10b981;
+  --success-light: #ecfdf5;
+  --danger: #ef4444;
+  --danger-light: #fef2f2;
+  --warning: #f59e0b;
+  --purple: #a855f7;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.05);
+  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
+  --shadow-lg: 0 4px 16px rgba(0,0,0,.08);
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono: "Cascadia Code", "Fira Code", "Consolas", "SF Mono", monospace;
+  --transition: 180ms cubic-bezier(.4,0,.2,1);
+  --section-new: #3b82f6;
+  --section-retest: #10b981;
+  --section-review: #ef4444;
+  --section-other: #a855f7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-root: #0f172a;
+    --bg-card: #1e293b;
+    --bg-input: #1e293b;
+    --bg-hover: #334155;
+    --bg-active: #475569;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --text-inverse: #0f172a;
+    --border: #334155;
+    --border-focus: #60a5fa;
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --accent-light: #1e3a5f;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.2);
+    --shadow: 0 1px 3px rgba(0,0,0,.3);
+    --shadow-lg: 0 4px 16px rgba(0,0,0,.4);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Reset & Base
+   ═══════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%; overflow: hidden;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-root);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* ═══════════════════════════════════════════════════════
+   App Shell
+   ═══════════════════════════════════════════════════════ */
+#app {
+  display: flex; flex-direction: column;
+  height: 100vh; max-height: 100vh;
+}
+
+/* ── Header ─────────────────────────────────────────── */
+#header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  z-index: 10;
+  -webkit-app-region: drag;
+}
+#header .logo {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -.02em;
+}
+#header .logo .icon {
+  width: 26px; height: 26px;
+  background: linear-gradient(135deg, var(--accent), #7c3aed);
+  border-radius: 7px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; color: #fff;
+}
+#header .version {
+  font-size: 11px; color: var(--text-muted);
+  background: var(--bg-input); padding: 2px 8px;
+  border-radius: 99px;
+  -webkit-app-region: no-drag;
+}
+
+/* ── Main Layout ────────────────────────────────────── */
+#main {
+  display: flex; flex: 1; min-height: 0;
+}
+
+/* ── Left Panel ─────────────────────────────────────── */
+#left-panel {
+  width: 380px; min-width: 340px;
+  display: flex; flex-direction: column;
+  background: var(--bg-card);
+  border-right: 1px solid var(--border);
+}
+
+/* Tab Bar */
+#tab-bar {
+  display: flex; gap: 0;
+  padding: 12px 14px 0;
+}
+.tab-btn {
+  padding: 7px 18px;
+  font-size: 13px; font-weight: 500;
+  color: var(--text-secondary);
+  background: none; border: none; border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  cursor: pointer; transition: var(--transition);
+  position: relative;
+}
+.tab-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+.tab-btn.active {
+  color: var(--accent);
+  background: var(--accent-light);
+}
+.tab-btn.active::after {
+  content: '';
+  position: absolute; bottom: 0; left: 8px; right: 8px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 2px 2px 0 0;
+}
+
+/* Tab Content */
+.tab-content { display: none; flex: 1; flex-direction: column; overflow-y: auto; padding: 14px; gap: 12px; }
+.tab-content.active { display: flex; }
+
+/* ── Form Elements ──────────────────────────────────── */
+.form-group { display: flex; flex-direction: column; gap: 4px; }
+.form-label {
+  font-size: 13px; font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: none; letter-spacing: .01em;
+}
+
+.input {
+  width: 100%; padding: 8px 12px;
+  font-size: 13px; font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  transition: var(--transition);
+}
+.input:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+}
+.input-mono { font-family: var(--font-mono); }
+
+.btn-row {
+  display: flex; gap: 6px;
+}
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  padding: 7px 14px;
+  font-size: 13px; font-weight: 500;
+  font-family: var(--font-sans);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: var(--transition);
+  white-space: nowrap;
+  outline: none;
+  -webkit-app-region: no-drag;
+}
+.btn:active { transform: scale(.97); }
+
+.btn-primary {
+  background: var(--accent); color: var(--text-inverse);
+}
+.btn-primary:hover { background: var(--accent-hover); }
+
+.btn-secondary {
+  background: var(--bg-card); color: var(--text-secondary);
+  border-color: var(--border);
+}
+.btn-secondary:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.btn-ghost {
+  background: transparent; color: var(--text-secondary);
+}
+.btn-ghost:hover { background: var(--bg-hover); }
+
+.btn-sm { padding: 5px 10px; font-size: 13px; }
+.btn-xs { padding: 3px 8px; font-size: 11px; border-radius: 4px; }
+
+.btn:disabled {
+  opacity: .55; cursor: not-allowed; pointer-events: none;
+}
+
+/* Icon button */
+.btn-icon {
+  width: 30px; height: 30px; padding: 0;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+}
+
+/* ── Quick Buttons Row ──────────────────────────────── */
+.quick-btns {
+  display: flex; gap: 4px;
+}
+.quick-btn {
+  padding: 6px 10px; font-size: 13px; font-weight: 500;
+  background: var(--bg-input); color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  cursor: pointer; transition: var(--transition);
+  font-family: var(--font-sans);
+}
+.quick-btn:hover { background: var(--accent-light); color: var(--accent); border-color: var(--accent); }
+
+/* ── Checkbox ───────────────────────────────────────── */
+.checkbox-row {
+  display: flex; align-items: center; gap: 8px; padding: 3px 0;
+  cursor: pointer;
+}
+.checkbox-row input[type=checkbox] { display: none; }
+.checkbox-custom {
+  width: 18px; height: 18px;
+  border: 2px solid var(--border);
+  border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  transition: var(--transition);
+  flex-shrink: 0;
+  font-size: 11px; color: transparent;
+}
+.checkbox-row input:checked + .checkbox-custom {
+  background: var(--accent); border-color: var(--accent);
+  color: #fff;
+}
+.checkbox-row:hover .checkbox-custom { border-color: var(--accent); }
+
+/* Settings toggle (checkbox styled as switch) */
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 0; gap: 10px;
+}
+.toggle-row .toggle-label {
+  font-size: 13px; color: var(--text-primary);
+  flex: 1;
+}
+.toggle-row .toggle-hint {
+  font-size: 11px; color: var(--text-muted);
+}
+.toggle {
+  position: relative; width: 40px; height: 22px; flex-shrink: 0;
+}
+.toggle input { display: none; }
+.toggle .track {
+  display: block; width: 100%; height: 100%;
+  background: var(--border); border-radius: 99px;
+  cursor: pointer; transition: var(--transition);
+}
+.toggle .thumb {
+  position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px;
+  background: #fff; border-radius: 50%;
+  transition: var(--transition);
+  box-shadow: var(--shadow-sm);
+}
+.toggle input:checked + .track { background: var(--accent); }
+.toggle input:checked + .track + .thumb,
+.toggle input:checked + .track .thumb { left: 20px; }
+/* Fix thumb positioning */
+.toggle label { position: relative; display: block; width: 100%; height: 100%; }
+.toggle input:checked ~ .thumb { left: 20px; }
+.toggle .thumb { pointer-events: none; }
+
+/* ── Scrollable Project List ────────────────────────── */
+.project-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  max-height: 230px; overflow-y: auto;
+  padding: 6px;
+}
+.project-list .checkbox-row {
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.project-list .checkbox-row:hover { background: var(--bg-hover); }
+
+/* ── Divider ────────────────────────────────────────── */
+.divider {
+  height: 1px; background: var(--border);
+  margin: 4px 0;
+}
+
+/* ── Right Panel ────────────────────────────────────── */
+#right-panel {
+  flex: 1; display: flex; flex-direction: column;
+  background: var(--bg-root);
+  min-width: 300px;
+}
+
+.preview-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 18px;
+}
+.preview-title {
+  font-size: 14px; font-weight: 600;
+  color: var(--text-primary);
+  display: flex; align-items: center; gap: 7px;
+}
+.preview-summary {
+  font-size: 11px; color: var(--text-muted);
+  text-align: right; line-height: 1.5;
+}
+
+.preview-content {
+  flex: 1; margin: 0 14px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: auto;
+  box-shadow: var(--shadow-sm);
+}
+.preview-content pre {
+  padding: 18px; margin: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-primary);
+  white-space: pre-wrap; word-break: break-word;
+  min-height: 100%;
+}
+
+/* Color spans in preview */
+.c-new { color: var(--section-new); }
+.c-retest { color: var(--section-retest); }
+.c-review { color: var(--section-review); }
+.c-other { color: var(--section-other); }
+.c-title { color: var(--accent); font-weight: 600; }
+.c-timing { color: var(--text-muted); font-size: 12px; }
+
+/* ── Status Bar ─────────────────────────────────────── */
+#status-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 16px;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border);
+  font-size: 13px; color: var(--text-secondary);
+  gap: 12px;
+}
+#status-text {
+  flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#status-progress {
+  display: none; width: 100px; height: 3px;
+  background: var(--border); border-radius: 99px; overflow: hidden;
+  flex-shrink: 0;
+}
+#status-progress.show { display: block; }
+#status-progress .bar {
+  width: 30%; height: 100%;
+  background: linear-gradient(90deg, var(--accent), #7c3aed);
+  border-radius: 99px;
+  animation: progress-indeterminate 1.4s ease-in-out infinite;
+}
+@keyframes progress-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(430%); }
+}
+
+/* ── Toast ──────────────────────────────────────────── */
+#toast-container {
+  position: fixed; top: 12px; right: 12px; z-index: 999;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.toast {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  font-size: 13px;
+  animation: toast-in .25s ease;
+  max-width: 340px;
+}
+.toast.success { border-left: 3px solid var(--success); }
+.toast.error { border-left: 3px solid var(--danger); }
+.toast.warning { border-left: 3px solid var(--warning); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* ── Spinner ────────────────────────────────────────── */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner {
+  width: 16px; height: 16px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+  display: inline-block;
+}
+
+/* ── Empty State ────────────────────────────────────── */
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100%; color: var(--text-muted); gap: 8px;
+  padding: 40px;
+}
+.empty-state .icon { font-size: 40px; opacity: .4; }
+.empty-state .text { font-size: 13px; text-align: center; line-height: 1.6; }
+
+/* ── Scrollbar ──────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Section link hints ─────────────────────────────── */
+.section-badge {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 4px;
+}
+.badge-new { background: var(--section-new); }
+.badge-retest { background: var(--section-retest); }
+.badge-review { background: var(--section-review); }
+.badge-other { background: var(--section-other); }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- Header -->
+  <header id="header">
+    <div class="logo">
+      <div class="icon">📋</div>
+      <span>Redmine 日报生成工具</span>
+    </div>
+    <span class="version" id="version-tag"></span>
+  </header>
+
+  <!-- Main Content -->
+  <div id="main">
+    <!-- Left Panel -->
+    <aside id="left-panel">
+      <div id="tab-bar">
+        <button class="tab-btn active" data-tab="generate">📝 日报生成</button>
+        <button class="tab-btn" data-tab="settings">⚙️ 设置</button>
+      </div>
+
+      <!-- Tab: Generate -->
+      <div class="tab-content active" id="tab-generate">
+        <div class="form-group">
+          <label class="form-label">报告日期</label>
+          <div class="btn-row">
+            <input type="date" id="report-date" class="input" style="flex:1">
+            <button class="quick-btn" onclick="setDateToday()">今天</button>
+            <button class="quick-btn" onclick="setDateYesterday()">昨天</button>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">下班时间</label>
+          <div class="btn-row">
+            <input type="time" id="report-time" class="input" style="flex:1">
+            <button class="quick-btn" onclick="setTimeNow()">现在</button>
+            <button class="quick-btn" onclick="setTime('17:30')">17:30</button>
+            <button class="quick-btn" onclick="setTime('20:30')">20:30</button>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btn-generate" onclick="doGenerate(false)" style="flex:2">
+            🚀 生成日报
+          </button>
+          <button class="btn btn-secondary" id="btn-copy" onclick="doCopy()" disabled style="flex:1">
+            📋 复制
+          </button>
+        </div>
+
+        <div class="form-group" style="flex:1; min-height:0;">
+          <label class="form-label">其他补充（自定义内容）</label>
+          <textarea id="custom-other" class="input"
+            style="flex:1; resize:none; font-family:var(--font-sans); font-size:13px; line-height:1.6;"
+            rows="6" placeholder="在此输入其他工作内容...&#10;每行一条"></textarea>
+        </div>
+      </div>
+
+      <!-- Tab: Settings -->
+      <div class="tab-content" id="tab-settings">
+        <div class="form-group">
+          <label class="form-label">服务器地址</label>
+          <input type="text" id="cfg-url" class="input input-mono"
+            placeholder="http://192.168.0.83:8181/redmine/"
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">API Key</label>
+          <div class="btn-row">
+            <input type="password" id="cfg-apikey" class="input input-mono" style="flex:1"
+              placeholder="输入 API 访问密钥">
+            <button class="btn btn-ghost btn-icon" id="btn-eye" onclick="toggleKeyVisibility()" title="显示/隐藏">👁</button>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <span class="form-label" style="margin:0;">📂 跟踪项目</span>
+          <button class="btn btn-primary btn-sm" id="btn-fetch-projects" onclick="fetchProjects()">
+            🔄 获取列表
+          </button>
+        </div>
+
+        <div class="project-list" id="project-list">
+          <div style="color:var(--text-muted);font-size:13px;padding:12px;text-align:center;">
+            请先获取项目列表
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-ghost btn-sm" onclick="selectAllProjects()" style="flex:1">全选</button>
+          <button class="btn btn-ghost btn-sm" onclick="deselectAllProjects()" style="flex:1">全不选</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="toggle-row">
+          <span class="toggle-label">⚡ 跳过审核复核</span>
+          <span class="toggle-hint">仅查本人Issue，大幅提速</span>
+          <div class="toggle">
+            <input type="checkbox" id="cfg-skip-review">
+            <label for="cfg-skip-review" class="track"></label>
+            <div class="thumb"></div>
+          </div>
+        </div>
+
+        <div class="toggle-row">
+          <span class="toggle-label">🔍 审核复核严格模式</span>
+          <span class="toggle-hint">仅计入状态/指派变更</span>
+          <div class="toggle">
+            <input type="checkbox" id="cfg-review-strict" checked>
+            <label for="cfg-review-strict" class="track"></label>
+            <div class="thumb"></div>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-primary btn-sm" id="btn-test-conn" onclick="testConnection()" style="flex:1">
+            🔍 测试连接
+          </button>
+          <button class="btn btn-primary btn-sm" onclick="doGenerate(true)" style="flex:1">
+            ⏱ 耗时分析
+          </button>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="saveConfig()" style="flex:1;font-weight:600;">
+            💾 保存设置
+          </button>
+          <button class="btn btn-secondary" onclick="resetConfig()" style="flex:1;">
+            🗑 重置
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Right Panel -->
+    <section id="right-panel">
+      <div class="preview-header">
+        <span class="preview-title" id="preview-title">📋 日报预览</span>
+        <span class="preview-summary" id="preview-summary"></span>
+      </div>
+      <div class="preview-content" id="preview-content">
+        <div class="empty-state">
+          <span class="icon">📋</span>
+          <span class="text">请填写左侧连接信息，<br>然后点击「生成日报」。</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Status Bar -->
+  <footer id="status-bar">
+    <span id="status-text">就绪</span>
+    <div id="status-progress"><div class="bar"></div></div>
+  </footer>
+
+  <!-- Toast Container -->
+  <div id="toast-container"></div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════
+   App State & API
+   ═══════════════════════════════════════════════════════ */
+
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+
+const state = {
+  reportContent: '',
+  projectData: [],  // [{id, name, checked}] from fetch
+};
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(path, opts);
+  return res.json();
+}
+
+/* ═══════════════════════════════════════════════════════
+   Initialization
+   ═══════════════════════════════════════════════════════ */
+
+async function init() {
+  // Set defaults
+  setDateToday();
+  setTimeNow();
+
+  // Load version
+  try {
+    const r = await api('GET', '/api/version');
+    if (r.ok && r.data.build_time) {
+      $('#version-tag').textContent = 'v' + r.data.build_time;
+    }
+  } catch(e) {}
+
+  // Load config
+  try {
+    const r = await api('GET', '/api/load-config');
+    if (r.ok && r.data) {
+      const d = r.data;
+      if (d.url) $('#cfg-url').value = d.url;
+      if (d.api_key) $('#cfg-apikey').value = d.api_key;
+      $('#cfg-skip-review').checked = d.skip_review;
+      $('#cfg-review-strict').checked = d.review_strict;
+
+      // Restore project list from saved data
+      if (d.projects && d.projects.length > 0) {
+        state.projectData = d.projects.map(p => ({
+          ...p, checked: d.project_ids.includes(p.id)
+        }));
+        renderProjectList();
+      }
+    }
+  } catch(e) {
+    console.error('Config load failed:', e);
+  }
+
+  // Tab switching
+  $$('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+
+  // Auto-save on input change (500ms debounce)
+  let saveTimer;
+  const autoSaveInputs = ['#cfg-url', '#cfg-apikey', '#cfg-skip-review', '#cfg-review-strict'];
+  autoSaveInputs.forEach(sel => {
+    const el = $(sel);
+    if (!el) return;
+    el.addEventListener('input', () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(saveConfigSilent, 500);
+    });
+    el.addEventListener('change', () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(saveConfigSilent, 500);
+    });
+  });
+}
+
+/* ═══════════════════════════════════════════════════════
+   Tab Switching
+   ═══════════════════════════════════════════════════════ */
+
+function switchTab(tab) {
+  // Auto-save when leaving settings tab
+  if (!$('#tab-settings').classList.contains('active') && tab === 'generate') {
+    saveConfigSilent();
+  }
+
+  $$('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  $('#tab-generate').classList.toggle('active', tab === 'generate');
+  $('#tab-settings').classList.toggle('active', tab === 'settings');
+}
+
+/* ═══════════════════════════════════════════════════════
+   Date & Time Helpers
+   ═══════════════════════════════════════════════════════ */
+
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' +
+    String(d.getMonth()+1).padStart(2,'0') + '-' +
+    String(d.getDate()).padStart(2,'0');
+}
+
+function yesterdayStr() {
+  const d = new Date(Date.now() - 86400000);
+  return d.getFullYear() + '-' +
+    String(d.getMonth()+1).padStart(2,'0') + '-' +
+    String(d.getDate()).padStart(2,'0');
+}
+
+function nowTimeStr() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2,'0') + ':' +
+    String(d.getMinutes()).padStart(2,'0');
+}
+
+function setDateToday() { $('#report-date').value = todayStr(); }
+function setDateYesterday() { $('#report-date').value = yesterdayStr(); }
+function setTimeNow() { $('#report-time').value = nowTimeStr(); }
+function setTime(t) { $('#report-time').value = t; }
+
+/* ═══════════════════════════════════════════════════════
+   Toast
+   ═══════════════════════════════════════════════════════ */
+
+function toast(msg, type='success') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  $('#toast-container').appendChild(el);
+  setTimeout(() => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateX(20px)';
+    el.style.transition = 'all .2s ease';
+    setTimeout(() => el.remove(), 250);
+  }, 2500);
+}
+
+/* ═══════════════════════════════════════════════════════
+   Status Bar
+   ═══════════════════════════════════════════════════════ */
+
+function setStatus(text, loading=false) {
+  $('#status-text').textContent = text;
+  $('#status-progress').classList.toggle('show', loading);
+}
+
+/* ═══════════════════════════════════════════════════════
+   Project List
+   ═══════════════════════════════════════════════════════ */
+
+async function fetchProjects() {
+  const url = $('#cfg-url').value.trim();
+  const apiKey = $('#cfg-apikey').value.trim();
+  if (!url || !apiKey) {
+    toast('请先输入服务器地址和 API Key', 'warning');
+    return;
+  }
+
+  const btn = $('#btn-fetch-projects');
+  btn.disabled = true;
+  btn.textContent = '⏳ 获取中...';
+  setStatus('正在获取项目列表...', true);
+
+  try {
+    const r = await api('POST', '/api/fetch-projects', { url, api_key: apiKey });
+    if (!r.ok) { toast(r.error, 'error'); return; }
+
+    state.projectData = r.data.projects.map(p => ({
+      ...p, checked: true  // Default: all selected
+    }));
+    renderProjectList();
+    toast(`已加载 ${r.data.projects.length} 个项目`);
+    setStatus(`已加载 ${r.data.projects.length} 个项目（勾选 ${getSelectedIds().length} 个）`);
+  } catch(e) {
+    toast('获取失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔄 获取列表';
+    setStatus('就绪');
+  }
+}
+
+function renderProjectList() {
+  const container = $('#project-list');
+  if (!state.projectData.length) {
+    container.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px;text-align:center;">暂无项目，请点击「获取列表」</div>';
+    return;
+  }
+
+  container.innerHTML = state.projectData.map((p, i) => `
+    <label class="checkbox-row">
+      <input type="checkbox" ${p.checked ? 'checked' : ''}
+        onchange="state.projectData[${i}].checked = this.checked; autoSaveDebounce()">
+      <span class="checkbox-custom">✓</span>
+      <span>${escHtml(p.name)}</span>
+    </label>
+  `).join('');
+}
+
+function selectAllProjects() {
+  state.projectData.forEach(p => p.checked = true);
+  renderProjectList();
+  autoSaveDebounce();
+}
+
+function deselectAllProjects() {
+  state.projectData.forEach(p => p.checked = false);
+  renderProjectList();
+  autoSaveDebounce();
+}
+
+function getSelectedIds() {
+  return state.projectData.filter(p => p.checked).map(p => p.id);
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* ═══════════════════════════════════════════════════════
+   Settings
+   ═══════════════════════════════════════════════════════ */
+
+let _autoSaveTimer;
+function autoSaveDebounce() {
+  clearTimeout(_autoSaveTimer);
+  _autoSaveTimer = setTimeout(saveConfigSilent, 500);
+}
+
+async function saveConfigSilent() {
+  try {
+    await api('POST', '/api/save-config', getConfigPayload());
+  } catch(e) { /* ignore */ }
+}
+
+async function saveConfig() {
+  try {
+    const r = await api('POST', '/api/save-config', getConfigPayload());
+    if (r.ok) toast('设置已保存 ✓');
+    else toast(r.error, 'error');
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'error');
+  }
+}
+
+function getConfigPayload() {
+  return {
+    url: $('#cfg-url').value.trim(),
+    api_key: $('#cfg-apikey').value.trim(),
+    project_ids: getSelectedIds(),
+    projects: state.projectData,
+    skip_review: $('#cfg-skip-review').checked,
+    review_strict: $('#cfg-review-strict').checked,
+  };
+}
+
+async function resetConfig() {
+  if (!confirm('将清除所有设置，恢复到初始状态。\n\n确定要重置吗？')) return;
+
+  try {
+    await api('POST', '/api/reset-config');
+    $('#cfg-url').value = '';
+    $('#cfg-apikey').value = '';
+    $('#cfg-skip-review').checked = false;
+    $('#cfg-review-strict').checked = true;
+    state.projectData = [];
+    renderProjectList();
+    toast('设置已重置');
+  } catch(e) {
+    toast('重置失败: ' + e.message, 'error');
+  }
+}
+
+function toggleKeyVisibility() {
+  const inp = $('#cfg-apikey');
+  const btn = $('#btn-eye');
+  if (inp.type === 'password') {
+    inp.type = 'text';
+    btn.textContent = '🙈';
+  } else {
+    inp.type = 'password';
+    btn.textContent = '👁';
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Test Connection
+   ═══════════════════════════════════════════════════════ */
+
+async function testConnection() {
+  const url = $('#cfg-url').value.trim();
+  const apiKey = $('#cfg-apikey').value.trim();
+  if (!url) { toast('请输入服务器地址', 'warning'); return; }
+  if (!apiKey) { toast('请输入 API Key', 'warning'); return; }
+
+  const btn = document.querySelector('#btn-test-conn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 测试中...';
+  setStatus('正在测试连接...', true);
+
+  try {
+    const r = await api('POST', '/api/test-connection', { url, api_key: apiKey });
+    updatePreview(
+      r.data.success ? '🔍 连接测试' : '🔍 连接测试失败',
+      r.data.message,
+      r.data.success ? {} : null
+    );
+
+    if (r.data.success) {
+      setStatus('连接测试通过 ✓');
+      toast('连接成功！');
+    } else {
+      setStatus('连接测试失败 ✗');
+      toast('连接失败，请查看详情', 'error');
+    }
+  } catch(e) {
+    toast('测试失败: ' + e.message, 'error');
+    setStatus('连接测试出错');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔍 测试连接';
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Generate Report
+   ═══════════════════════════════════════════════════════ */
+
+async function doGenerate(showTiming) {
+  const url = $('#cfg-url').value.trim();
+  const apiKey = $('#cfg-apikey').value.trim();
+  const date = $('#report-date').value;
+  const time = $('#report-time').value;
+  const customOther = $('#custom-other').value.trim();
+  const skipReview = $('#cfg-skip-review').checked;
+  const reviewStrict = $('#cfg-review-strict').checked;
+  const projectIds = getSelectedIds();
+
+  if (!url) { toast('请输入服务器地址', 'warning'); switchTab('settings'); return; }
+  if (!apiKey) { toast('请输入 API Key', 'warning'); switchTab('settings'); return; }
+  if (!date) { toast('请输入报告日期', 'warning'); return; }
+
+  const btnGen = $('#btn-generate');
+  const btnCopy = $('#btn-copy');
+  const btnPerf = document.querySelector('#btn-test-conn + button');  // 耗时分析按钮在测试连接右边
+  btnGen.disabled = true;
+  btnGen.innerHTML = '<span class="spinner"></span> 获取中...';
+  btnCopy.disabled = true;
+  if (btnPerf) { btnPerf.disabled = true; btnPerf.textContent = '⏳ 分析中...'; }
+  setStatus(showTiming ? '正在进行耗时分析...' : '正在连接 Redmine...', true);
+
+  const path = showTiming ? '/api/analyze-performance' : '/api/generate';
+
+  try {
+    const r = await api('POST', path, {
+      url, api_key: apiKey, date, time, project_ids: projectIds,
+      custom_other: customOther, skip_review: skipReview,
+      review_strict: reviewStrict,
+    });
+
+    if (!r.ok) {
+      toast(r.error, 'error');
+      setStatus('生成失败');
+      updatePreview('❌ 生成失败', r.error, null);
+      return;
+    }
+
+    const { content, summary } = r.data;
+    state.reportContent = content;
+
+    // Render colorized preview
+    updatePreview(
+      showTiming ? '⏱ 耗时分析' : '📋 日报预览',
+      content,
+      summary
+    );
+
+    btnCopy.disabled = false;
+
+    const timingStr = (showTiming && summary.timing && summary.timing.build_total)
+      ? ` | 总耗时${summary.timing.build_total}s` : '';
+    $('#preview-summary').textContent =
+      `用户: ${summary.user_name} | 问题: ${summary.total_issues}个 | 项目: ${summary.project_count}个${timingStr}`;
+
+    setStatus(showTiming
+      ? `耗时分析完成 — ${summary.date} | 总耗时${summary.timing?.build_total || '?'}s`
+      : `日报已生成 — ${summary.date} | ${summary.total_issues}个问题`);
+    toast(showTiming ? '耗时分析完成！' : '日报生成成功！');
+  } catch(e) {
+    toast('生成失败: ' + e.message, 'error');
+    setStatus('生成失败');
+  } finally {
+    btnGen.disabled = false;
+    btnGen.innerHTML = '🚀 生成日报';
+    if (btnPerf) { btnPerf.disabled = false; btnPerf.textContent = '⏱ 耗时分析'; }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Preview Rendering
+   ═══════════════════════════════════════════════════════ */
+
+function updatePreview(title, content, summary) {
+  $('#preview-title').textContent = title;
+
+  if (!content) {
+    $('#preview-content').innerHTML = `
+      <div class="empty-state">
+        <span class="icon">📋</span>
+        <span class="text">${escHtml(title)}</span>
+      </div>`;
+    return;
+  }
+
+  // Color-code the content
+  const sectionColors = {
+    '1）': 'c-new',
+    '2）': 'c-retest',
+    '3）': 'c-review',
+    '4）': 'c-other',
+  };
+  const lines = content.split('\n');
+  let currentSection = null;
+  const htmlLines = lines.map(line => {
+    const escaped = escHtml(line);
+
+    // Title line (contains 工作汇报)
+    if (escaped.includes('工作汇报')) {
+      return `<span class="c-title">${escaped}</span>`;
+    }
+
+    // Section headers
+    for (const [prefix, cls] of Object.entries(sectionColors)) {
+      if (line.startsWith(prefix)) {
+        currentSection = cls;
+        return `<span class="${cls}">${escaped}</span>`;
+      }
+    }
+
+    // Separator lines & attendance
+    if (line.startsWith('===') || line.startsWith('考勤') ||
+        line.startsWith('上班') || line.startsWith('中途')) {
+      return escaped;
+    }
+
+    // Timing info
+    if (line.startsWith('───') && line.includes('耗时')) {
+      return `<span class="c-timing">${escaped}</span>`;
+    }
+
+    // Content lines inherit section color
+    if (currentSection && escaped.trim()) {
+      return `<span class="${currentSection}">${escaped}</span>`;
+    }
+
+    return escaped;
+  });
+
+  $('#preview-content').innerHTML = `<pre>${htmlLines.join('\n')}</pre>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Copy to Clipboard
+   ═══════════════════════════════════════════════════════ */
+
+async function doCopy() {
+  if (!state.reportContent) {
+    toast('没有可复制的内容', 'warning');
+    return;
+  }
+
+  try {
+    const r = await api('POST', '/api/copy', { content: state.reportContent });
+    if (r.ok) {
+      toast('日报已复制到剪贴板 ✓（带格式）');
+      setStatus('日报已复制到剪贴板 ✓');
+    } else {
+      // Fallback: use browser clipboard for plain text
+      await navigator.clipboard.writeText(state.reportContent);
+      toast('日报已复制到剪贴板 ✓');
+      setStatus('日报已复制到剪贴板 ✓');
+    }
+  } catch(e) {
+    // Fallback
+    try {
+      await navigator.clipboard.writeText(state.reportContent);
+      toast('日报已复制到剪贴板 ✓');
+    } catch(e2) {
+      toast('复制失败', 'error');
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   Keyboard Shortcuts
+   ═══════════════════════════════════════════════════════ */
+
+document.addEventListener('keydown', (e) => {
+  // Ctrl+Enter or Ctrl+G: Generate
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'g')) {
+    e.preventDefault();
+    doGenerate(false);
+  }
+  // Ctrl+Shift+C: Copy
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'C') {
+    e.preventDefault();
+    doCopy();
+  }
+});
+
+/* ═══════════════════════════════════════════════════════
+   Start
+   ═══════════════════════════════════════════════════════ */
+
+init();
+</script>
+</body>
+</html>

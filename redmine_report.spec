@@ -15,13 +15,17 @@ ROOT = Path(SPECPATH)  # SPECPATH 是 .spec 文件所在目录
 
 # ── 需要收集的隐藏导入 ──
 hidden_imports = [
-    # customtkinter 内部模块
-    "customtkinter",
-    "customtkinter.windows",
-    "customtkinter.windows.widgets",
-    "customtkinter.windows.widgets.core_widget_classes",
-    "customtkinter.windows.widgets.theme",
-    "customtkinter.themes",
+    # Flask / Werkzeug
+    "flask",
+    "flask.json",
+    "werkzeug",
+    "werkzeug.serving",
+    # pywebview
+    "webview",
+    "webview.platforms",
+    "webview.platforms.edgechromium",
+    "webview.platforms.winforms",
+    "webview.js",
     # redminelib
     "redminelib",
     "redminelib.resources",
@@ -29,28 +33,25 @@ hidden_imports = [
     "redminelib.exceptions",
     # PyYAML
     "yaml",
+    # win32clipboard
+    "win32clipboard",
+    "pywin32",
     # 标准库可能被遗漏的
     "json",
     "datetime",
     "pathlib",
     "threading",
+    "concurrent.futures",
 ]
 
 # ── 需要收集的数据文件 ──
 datas = [
+    # 前端 HTML 文件
+    (
+        str(ROOT / "redmine_report" / "gui_frontend.html"),
+        "redmine_report",
+    ),
 ]
-
-# 收集 customtkinter 的主题资源
-try:
-    import customtkinter as ctk
-    ctk_dir = Path(ctk.__file__).parent
-    # 主题 JSON 文件
-    theme_dir = ctk_dir
-    for pattern in ["*.json"]:
-        for f in theme_dir.glob(pattern):
-            datas.append((str(f), "customtkinter"))
-except ImportError:
-    pass
 
 # ── Spec 配置 ──
 a = Analysis(
@@ -64,12 +65,16 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         # 排除不需要的大型库，减小 exe 体积
+        "tkinter",
         "tkinter.test",
+        "customtkinter",
         "unittest",
         "pydoc",
-        "distutils",
         "setuptools",
         "pip",
+        "PIL",
+        "numpy",
+        "pandas",
     ],
     noarchive=False,
     optimize=0,
