@@ -628,7 +628,7 @@ async function init() {
       // Restore project list from saved data
       if (d.projects && d.projects.length > 0) {
         state.projectData = d.projects.map(p => ({
-          ...p, checked: d.project_ids.includes(p.id)
+          ...p, checked: p.checked !== undefined ? p.checked : true
         }));
         renderProjectList();
       }

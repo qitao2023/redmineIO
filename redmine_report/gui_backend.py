@@ -72,12 +72,25 @@ def api_load_config():
     project_names = data.get("project_names", {})
 
     # 构建项目列表（离线还原，无需联网）
+    # 展示所有已知项目：勾选的 + 未勾选的
     projects = []
     project_ids = data.get("project_ids", []) or []
+
+    # 收集所有已知项目 ID（来自 project_names 和 project_ids）
+    all_ids = set()
     for pid in project_ids:
-        pid_str = str(pid)
+        all_ids.add(str(pid))
+    for pid_str in project_names.keys():
+        all_ids.add(pid_str)
+
+    for pid_str in sorted(all_ids, key=lambda x: int(x)):
+        pid = int(pid_str)
         name = project_names.get(pid_str, f"项目 #{pid}")
-        projects.append({"id": int(pid), "name": name})
+        projects.append({
+            "id": pid,
+            "name": name,
+            "checked": pid in project_ids,
+        })
 
     return _ok({
         "url": data.get("redmine_url", ""),
