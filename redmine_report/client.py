@@ -40,6 +40,7 @@ class RedmineClient:
         self._api_key = api_key
         self._redmine: Redmine | None = None
         self._last_timing: dict = {}
+        self._status_map: dict[str, str] | None = None  # status_id → status_name
 
         try:
             self._redmine = Redmine(
@@ -78,6 +79,128 @@ class RedmineClient:
             )
         except BaseRedmineError as e:
             raise RedmineClientError(f"认证过程出错: {str(e)[:200]}") from e
+
+    def _ensure_status_map(self) -> None:
+        """懒加载 status_id → status_name 映射。"""
+        if self._status_map is not None:
+            return
+        self._status_map = {}
+        try:
+            for s in self._redmine.issue_status.all():
+                self._status_map[str(s.id)] = s.name
+            logger.info("状态映射已加载: %d 个状态", len(self._status_map))
+        except Exception as e:
+            logger.warning("批量加载状态映射失败: %s，将按需单条查询", str(e)[:120])
+
+    def _lookup_status(self, status_id: str) -> str:
+        """按 status_id 查名称，缓存未命中时按需单条查询。"""
+        self._ensure_status_map()
+        if status_id in self._status_map:
+            return self._status_map[status_id]
+        try:
+            s = self._redmine.issue_status.get(int(status_id))
+            self._status_map[status_id] = s.name
+            logger.info("按需查询状态 id=%s → %s", status_id, s.name)
+            return s.name
+        except Exception:
+            logger.warning("按需查询状态 id=%s 失败", status_id)
+            return ""
+
+    def _get_effective_status(self, detailed_issue: Any, user_id: int,
+                              report_date: str) -> str:
+        """确定当事人在报告日期最后一次接触 Issue 时的有效状态。
+
+        规则：
+        1. 当事人亲自改了状态 → 用 new_value
+        2. 当事人没改状态 → 往前追溯最近的状态变更；
+           往前没找到 → 往后找第一条状态变更的 old_value
+        3. 无当事人 journal + 本人今日创建 → 从历史记录反推初始状态
+        4. 其他 → 回退当前状态
+        """
+        journals = list(getattr(detailed_issue, "journals", []))
+        self._ensure_status_map()
+
+        # 检查是否本人今日创建
+        author_id = getattr(detailed_issue.author, "id", 0) if hasattr(detailed_issue, "author") else 0
+        created_on = self._to_beijing_date(getattr(detailed_issue, "created_on", None))
+        is_new_today = (int(author_id) == int(user_id) and created_on == report_date)
+
+        # 找到当事人在报告日期的最后一次 journal 及其状态变更
+        user_last_idx = -1
+        user_status_new = None
+
+        for i, journal in enumerate(journals):
+            ju = getattr(journal, "user", None)
+            jid = getattr(ju, "id", None) if ju else None
+            if str(jid) != str(user_id):
+                continue
+            jd = self._to_beijing_date(getattr(journal, "created_on", None))
+            if jd != report_date:
+                continue
+            user_last_idx = i
+            for d in getattr(journal, "details", []):
+                dd = dict(d) if hasattr(d, '__iter__') else {}
+                if str(dd.get("name", "")) == "status_id":
+                    user_status_new = str(dd.get("new_value", ""))
+
+        if user_last_idx < 0:
+            if is_new_today:
+                # 本人今日创建但无 journal，从历史记录反推初始状态
+                return self._get_initial_status(detailed_issue)
+            return getattr(detailed_issue.status, "name", "")
+
+        if user_status_new:
+            return self._lookup_status(user_status_new) or getattr(
+                detailed_issue.status, "name", "")
+
+        # 当事人没改状态：
+        # 1) 往前追溯 — 找当事人 journal 之前的最后一条状态变更
+        # 2) 还没找到 → 往后追溯 — 第一条状态变更的 old_value 即当时状态
+        for i in range(user_last_idx - 1, -1, -1):
+            for d in getattr(journals[i], "details", []):
+                dd = dict(d) if hasattr(d, '__iter__') else {}
+                if str(dd.get("name", "")) == "status_id":
+                    sid = str(dd.get("new_value", ""))
+                    name = self._lookup_status(sid)
+                    if name:
+                        return name
+                    continue  # 状态不在map中，继续往前找
+
+        for i in range(user_last_idx + 1, len(journals)):
+            for d in getattr(journals[i], "details", []):
+                dd = dict(d) if hasattr(d, '__iter__') else {}
+                if str(dd.get("name", "")) == "status_id":
+                    old_id = str(dd.get("old_value", ""))
+                    if old_id:
+                        name = self._lookup_status(old_id)
+                        if name:
+                            return name
+                        continue  # 状态不在map中，继续往后找
+
+        # 完全没有状态变更记录，用当前状态（即初始状态）
+        return getattr(detailed_issue.status, "name", "")
+
+    def _get_initial_status(self, detailed_issue: Any) -> str:
+        """从历史记录反推 Issue 创建时的初始状态。
+
+        找第一条 status_id 变更的 old_value = 初始状态。
+        如果从未有过状态变更，当前状态即为初始状态。
+        """
+        journals = list(getattr(detailed_issue, "journals", []))
+        self._ensure_status_map()
+
+        for journal in journals:
+            for d in getattr(journal, "details", []):
+                dd = dict(d) if hasattr(d, '__iter__') else {}
+                if str(dd.get("name", "")) == "status_id":
+                    old_id = str(dd.get("old_value", ""))
+                    if old_id:
+                        name = self._lookup_status(old_id)
+                        if name:
+                            return name
+                        continue
+
+        return getattr(detailed_issue.status, "name", "")
 
     def list_projects(self) -> list[dict[str, Any]]:
         """列出当前用户可访问的所有项目。"""
@@ -290,9 +413,25 @@ class RedmineClient:
             tracker_name = getattr(issue.tracker, "name", "")
             created_on = self._to_beijing_date(getattr(issue, "created_on", None))
 
-            # 新增 — 本人创建 + 当天创建，无需 journal 验证
+            # 新增 — 本人创建 + 当天创建
+            # "支持"类：不限状态，始终取创建时的初始状态
+            # 其他类：取当事人最后一次操作时的有效状态
             if author_id == user_id and created_on == report_date:
-                data = self._extract_issue_data(issue)
+                status_override = ""
+                if tracker_name and "支持" in tracker_name:
+                    # 支持类：从历史记录反推初始状态
+                    try:
+                        detailed = self._redmine.issue.get(issue.id, include="journals")
+                        status_override = self._get_initial_status(detailed)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        detailed = self._redmine.issue.get(issue.id, include="journals")
+                        status_override = self._get_effective_status(detailed, user_id, report_date)
+                    except Exception:
+                        pass
+                data = self._extract_issue_data(issue, status_override=status_override)
                 if data["issue_id"] not in verified:
                     verified.add(data["issue_id"])
                     result.append(data)
@@ -525,7 +664,8 @@ class RedmineClient:
                     )
                 return None
 
-            return self._extract_issue_data(detailed)
+            status_override = self._get_effective_status(detailed, user_id, report_date)
+            return self._extract_issue_data(detailed, status_override=status_override)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_check_one, iss): iss for iss in issues}
