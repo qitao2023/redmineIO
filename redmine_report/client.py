@@ -575,7 +575,7 @@ class RedmineClient:
         report_date: str,
         seen: set[int],
         result: list[dict[str, Any]],
-        max_workers: int = 20,
+        max_workers: int = 60,
         review_strict: bool = False,
     ):
         """并发检查 Issue 的 journal，20 线程 + 重试 1 次。
@@ -593,7 +593,7 @@ class RedmineClient:
         debug_lock = threading.Lock()
 
         def _fetch_detailed(issue_id: int) -> tuple[Any, list] | None:
-            for attempt in range(2):
+            for attempt in range(1):
                 try:
                     detailed = self._redmine.issue.get(issue_id, include="journals")
                     journals = list(getattr(detailed, "journals", []))
@@ -800,7 +800,7 @@ class RedmineClient:
 
         raw_issues = self.get_issues_by_date(report_date, user_id,
                                               project_ids=project_ids,
-                                              user_name=user_info["name"],
+                                              user_name=user_info["login"],
                                               skip_review=skip_review,
                                               review_strict=review_strict,
                                               support_always_new=support_always_new,
@@ -851,7 +851,7 @@ class RedmineClient:
         timing["build_total"] = round(time.perf_counter() - t_build_start, 2)
 
         return DailyReport(
-            user_name=user_info["name"],
+            user_name=user_info["login"],
             date=report_date,
             weekday_cn=weekday_cn,
             entries=entries,
