@@ -322,6 +322,8 @@ class RedmineClient:
         user_name: str = "",
         skip_review: bool = False,
         review_strict: bool = False,
+        support_always_new: bool = False,
+        progress_callback: "callable | None" = None,
         limit: int = 300,
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
@@ -336,6 +338,10 @@ class RedmineClient:
             limit: 单次查询返回上限（仅用于覆盖 Redmine 默认 25 条分页限制）。
         """
         # project_ids 为空时：方案3 回退到原来的全站查询（不额外调用 membership API）
+        def _p(msg, pct):
+            if progress_callback:
+                progress_callback(msg, pct)
+
         t_total_start = time.perf_counter()
 
         seen: set[int] = set()
@@ -395,6 +401,7 @@ class RedmineClient:
             f"共 {query_count} 次查询，候选 {len(candidates)} 个 Issue",
             file=sys.stderr,
         )
+        _p(f"filter查询完成，候选{len(candidates)}个", 25)
 
         # ── 收集候选 Issue 详情（供调试召回）──
         candidates_detail: list[str] = []
@@ -418,8 +425,8 @@ class RedmineClient:
             # 其他类：取当事人最后一次操作时的有效状态
             if author_id == user_id and created_on == report_date:
                 status_override = ""
-                if tracker_name and "支持" in tracker_name:
-                    # 支持类：从历史记录反推初始状态
+                if support_always_new and tracker_name and "支持" in tracker_name:
+                    # 支持类 + 开关开启：从历史记录反推初始状态
                     try:
                         detailed = self._redmine.issue.get(issue.id, include="journals")
                         status_override = self._get_initial_status(detailed)
@@ -446,6 +453,7 @@ class RedmineClient:
             f"新增 {len(result)} 个 + 待验证 {len(need_journal_check)} 个",
             file=sys.stderr,
         )
+        _p(f"预分类完成，待验证{len(need_journal_check)}个", 40)
 
         # ═══ 阶段2.5: 搜索 API 预筛 ═══
         t_act_start = time.perf_counter()
@@ -474,6 +482,7 @@ class RedmineClient:
 
         # ═══ 阶段3: journal 验证 ═══
         result_before_journal = len(result)
+        _p(f"正在验证journal（共{len(need_journal_check)}个）...", 55)
         rejected = self._check_journals_concurrent(
             need_journal_check, user_id, report_date, verified, result,
             review_strict=review_strict,
@@ -481,6 +490,7 @@ class RedmineClient:
         t4 = time.perf_counter()
         journal_elapsed = t4 - t3
         confirmed_by_journal = len(result) - result_before_journal
+        _p(f"journal验证完成，确认{confirmed_by_journal}个", 80)
         print(
             f"  [计时] 阶段3-journal验证: {journal_elapsed:.2f}s，"
             f"检查 {len(need_journal_check)} 个 → 确认 {confirmed_by_journal} 个",
@@ -760,6 +770,8 @@ class RedmineClient:
         project_ids: list[int] | None = None,
         skip_review: bool = False,
         review_strict: bool = False,
+        support_always_new: bool = False,
+        progress_callback: "callable | None" = None,
     ) -> DailyReport:
         """编排所有 API 调用，构建完整的 DailyReport 对象。
 
@@ -768,21 +780,32 @@ class RedmineClient:
             project_ids: 限定查询的项目 ID 列表，None=自动获取。
             skip_review: True=跳过方案3（审核复核），大幅提速。
             review_strict: True=审核复核仅计入状态/指派变更，纯评论不算。
+            support_always_new: True=支持类Issue始终显示初始状态（新建）。
+            progress_callback: 进度回调 (msg, percent)。
         """
         t_build_start = time.perf_counter()
         if report_date is None:
             report_date = date.today().isoformat()
 
+        def _p(msg, pct):
+            if progress_callback:
+                progress_callback(msg, pct)
+
+        _p("正在认证...", 5)
         t_auth_start = time.perf_counter()
         user_info = self.authenticate()
         user_id = user_info["id"]
         auth_elapsed = time.perf_counter() - t_auth_start
+        _p("已认证，正在查询Issue列表...", 10)
 
         raw_issues = self.get_issues_by_date(report_date, user_id,
                                               project_ids=project_ids,
                                               user_name=user_info["name"],
                                               skip_review=skip_review,
-                                              review_strict=review_strict)
+                                              review_strict=review_strict,
+                                              support_always_new=support_always_new,
+                                              progress_callback=progress_callback)
+        _p(f"正在生成报告...({len(raw_issues)}个Issue)", 90)
         print(
             f"找到 {len(raw_issues)} 个 Issue（{report_date}）",
             file=sys.stderr,

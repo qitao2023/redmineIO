@@ -56,8 +56,7 @@ def run_gui():
     flask_thread.start()
 
     # 窗口标题
-    build_date = BUILD_TIME[:10] if BUILD_TIME else ""
-    title = f"Redmine 日报生成工具 [{build_date}]"
+    title = f"Redmine 日报生成工具 [{BUILD_TIME}]" if BUILD_TIME else "Redmine 日报生成工具"
 
     # 尝试加载图标
     icon_path = None
@@ -74,7 +73,7 @@ def run_gui():
         title=title,
         url=url,
         width=1100,
-        height=700,
+        height=740,
         min_size=(900, 550),
         resizable=True,
         fullscreen=False,

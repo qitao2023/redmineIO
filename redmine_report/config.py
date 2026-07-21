@@ -96,6 +96,8 @@ class Config:
             "project_ids": [],  # 手动指定项目 ID 列表，空列表=自动获取
             "skip_review": False,  # True=跳过审核复核，只查本人创建/经办的 Issue
             "review_strict": True,  # True=审核复核仅计入状态/指派变更，纯评论不算
+            "support_always_new": False,  # True=支持类Issue始终显示初始状态（新建）
+            "report_with_numbers": True,  # True=节号带数量 + issue带序号
         }
 
     def _find_config(self) -> Path | None:
@@ -134,9 +136,14 @@ class Config:
                 self.data["skip_review"] = rp["skip_review"]
             if "review_strict" in rp:
                 self.data["review_strict"] = rp["review_strict"]
+            if "support_always_new" in rp:
+                self.data["support_always_new"] = rp["support_always_new"]
+            if "report_with_numbers" in rp:
+                self.data["report_with_numbers"] = rp["report_with_numbers"]
 
         # 也支持顶层平铺字段
-        for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids", "skip_review", "review_strict"):
+        for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids",
+                     "skip_review", "review_strict", "support_always_new", "report_with_numbers"):
             if key in raw and raw[key]:
                 self.data[key] = raw[key]
 
@@ -206,6 +213,16 @@ class Config:
     def review_strict(self) -> bool:
         """审核复核是否仅计入状态/指派变更（纯评论不算）。"""
         return bool(self.data.get("review_strict", False))
+
+    @property
+    def support_always_new(self) -> bool:
+        """支持类 Issue 是否始终显示初始状态（新建），不跟随状态变更。"""
+        return bool(self.data.get("support_always_new", False))
+
+    @property
+    def report_with_numbers(self) -> bool:
+        """日报是否在节号后显示数量，issue 前带序号。"""
+        return bool(self.data.get("report_with_numbers", False))
 
 
 def load_config(

@@ -60,12 +60,14 @@ def _sort_key(e: IssueEntryData) -> tuple[int, int]:
     return (tracker_rank, priority_rank)
 
 
-def _format_entry(e: IssueEntryData, show_progress: bool = True) -> str:
+def _format_entry(e: IssueEntryData, show_progress: bool = True,
+                   item_num: int = 0) -> str:
     """格式化单条 Issue 为日报行，长行自动换行并缩进。"""
     tracker = e.tracker_name or ""
     status = f"({e.status_name})" if e.status_name else ""
     subject = e.issue_subject or ""
-    line = f"   {tracker} #{e.issue_id} {status}: {subject}"
+    prefix = f"   ({item_num}). " if item_num else "   "
+    line = f"{prefix}{tracker} #{e.issue_id} {status}: {subject}"
     if show_progress:
         line += " -100%；"
 
@@ -109,8 +111,12 @@ def generate_report(
     report: DailyReport,
     custom_other: str = "",
     end_time: str | None = None,
+    report_with_numbers: bool = False,
 ) -> str:
-    """生成纯文本日报。"""
+    """生成纯文本日报。
+
+    report_with_numbers=True 时：节号后显示数量，Issue 前带序号 (1). (2). ...
+    """
     groups: dict[str, list[IssueEntryData]] = {
         "新增": [],
         "复测": [],
@@ -148,10 +154,11 @@ def generate_report(
             if not entries:
                 continue
             section_num += 1
-            title = f"{section_num}）{group_key}："
+            count_suffix = f"({len(entries)}条)：" if report_with_numbers else "："
+            title = f"{section_num}）{group_key}{count_suffix}"
             lines.append(title)
-            for e in entries:
-                lines.append(_format_entry(e))
+            for i, e in enumerate(entries):
+                lines.append(_format_entry(e, item_num=i + 1 if report_with_numbers else 0))
 
     # 底部
     lines.append("========")

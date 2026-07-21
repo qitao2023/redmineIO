@@ -28,6 +28,11 @@ app = Flask(__name__)
 # 前端 HTML 文件路径
 _FRONTEND_PATH = Path(__file__).resolve().parent / "gui_frontend.html"
 
+# 异步生成任务存储
+import uuid as _uuid
+_task_store: dict[str, dict] = {}
+_task_lock = threading.Lock()
+
 
 # ── 静态首页 ────────────────────────────────────────────
 
@@ -99,6 +104,8 @@ def api_load_config():
         "projects": projects,
         "skip_review": data.get("skip_review", False),
         "review_strict": data.get("review_strict", True),
+        "support_always_new": data.get("support_always_new", False),
+        "report_with_numbers": data.get("report_with_numbers", True),
     })
 
 
@@ -125,6 +132,8 @@ def api_save_config():
         "project_names": project_names,
         "skip_review": body.get("skip_review", False),
         "review_strict": body.get("review_strict", True),
+        "support_always_new": body.get("support_always_new", False),
+        "report_with_numbers": body.get("report_with_numbers", True),
     }
 
     try:
@@ -223,19 +232,24 @@ def api_fetch_projects():
 def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
                  project_ids: list[int] | None, custom_other: str,
                  skip_review: bool, review_strict: bool,
-                 show_timing: bool) -> dict:
-    """在后台线程中执行日报生成（同步返回结果）。"""
+                 support_always_new: bool, report_with_numbers: bool,
+                 show_timing: bool,
+                 progress_callback=None) -> dict:
+    """在后台线程中执行日报生成。"""
     client = RedmineClient(url=url, api_key=api_key)
 
     proj_ids = project_ids if project_ids else None
     report = client.build_report_data(
         report_date, project_ids=proj_ids,
         skip_review=skip_review, review_strict=review_strict,
+        support_always_new=support_always_new,
+        progress_callback=progress_callback,
     )
 
     content = generate_report(
         report, custom_other=custom_other,
         end_time=end_time.strip() or None,
+        report_with_numbers=report_with_numbers,
     )
 
     timing = getattr(report, "timing", {})
@@ -310,7 +324,7 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         "date": report.date,
         "total_issues": report.total_issues,
         "project_count": report.project_count,
-        "timing": timing if show_timing else {},
+        "timing": timing,
     }
 
     return {
@@ -335,7 +349,9 @@ def api_analyze_performance():
 
 
 def _handle_generate(body: dict):
-    """处理日报生成请求（generate 和 analyze 共用）。"""
+    """处理日报生成请求（generate 和 analyze 共用）。
+    改为异步：立即返回 task_id，前端轮询 /api/progress 获取结果。
+    """
     url = body.get("url", "").strip()
     api_key = body.get("api_key", "").strip()
     report_date = body.get("date", "").strip()
@@ -344,6 +360,8 @@ def _handle_generate(body: dict):
     custom_other = body.get("custom_other", "").strip()
     skip_review = body.get("skip_review", False)
     review_strict = body.get("review_strict", True)
+    support_always_new = body.get("support_always_new", False)
+    report_with_numbers = body.get("report_with_numbers", False)
     show_timing = body.get("show_timing", False)
 
     if not url or not api_key:
@@ -351,38 +369,80 @@ def _handle_generate(body: dict):
     if not report_date:
         return _err("请输入报告日期")
 
-    try:
-        # 在后台线程中运行（Flask 线程安全，阻塞等待结果）
-        result = None
-        error = None
+    task_id = str(_uuid.uuid4())[:8]
+    with _task_lock:
+        _task_store[task_id] = {"status": "running", "progress": "准备中...",
+                                 "pct": 0, "result": None, "error": None,
+                                 "show_timing": show_timing}
 
-        def _run():
-            nonlocal result, error
-            try:
-                result = _do_generate(
-                    url, api_key, report_date, end_time,
-                    project_ids, custom_other,
-                    skip_review, review_strict, show_timing,
-                )
-            except RedmineClientError as e:
-                error = str(e)
-            except Exception as e:
-                error = f"未知错误: {str(e)[:300]}"
+    def _run():
+        try:
+            def _on_progress(msg, pct):
+                with _task_lock:
+                    if task_id in _task_store:
+                        _task_store[task_id]["progress"] = msg
+                        _task_store[task_id]["pct"] = pct
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        thread.join(timeout=120)  # 最长等 2 分钟
+            result = _do_generate(
+                url, api_key, report_date, end_time,
+                project_ids, custom_other,
+                skip_review, review_strict, support_always_new,
+                report_with_numbers, show_timing,
+                progress_callback=_on_progress,
+            )
+            with _task_lock:
+                if task_id in _task_store:
+                    _task_store[task_id]["status"] = "done"
+                    _task_store[task_id]["result"] = result
+                    _task_store[task_id]["pct"] = 100
+        except RedmineClientError as e:
+            with _task_lock:
+                if task_id in _task_store:
+                    _task_store[task_id]["status"] = "error"
+                    _task_store[task_id]["error"] = str(e)
+        except Exception as e:
+            with _task_lock:
+                if task_id in _task_store:
+                    _task_store[task_id]["status"] = "error"
+                    _task_store[task_id]["error"] = f"未知错误: {str(e)[:300]}"
 
-        if error:
-            return _err(error)
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
 
-        if result is None:
-            return _err("生成超时，请重试")
+    return _ok({"task_id": task_id})
 
-        return _ok(result)
 
-    except Exception as e:
-        return _err(f"生成失败: {str(e)[:300]}")
+@app.route("/api/progress/<task_id>", methods=["GET"])
+def api_progress(task_id):
+    """查询异步生成任务的进度和结果。"""
+    with _task_lock:
+        task = _task_store.get(task_id)
+    if task is None:
+        return _err("任务不存在或已过期")
+    return _ok({
+        "status": task["status"],
+        "progress": task["progress"],
+        "pct": task["pct"],
+        "result": task.get("result"),
+        "error": task.get("error"),
+        "show_timing": task.get("show_timing", False),
+    })
+
+
+# 定期清理过期任务
+def _cleanup_old_tasks():
+    """删除超过 10 分钟的旧任务。"""
+    import time as _time
+    while True:
+        _time.sleep(300)
+        with _task_lock:
+            # 简单策略：保留最近 50 个
+            while len(_task_store) > 50:
+                oldest = next(iter(_task_store))
+                del _task_store[oldest]
+
+_cleanup_thread = threading.Thread(target=_cleanup_old_tasks, daemon=True)
+_cleanup_thread.start()
 
 
 # ── 剪贴板 API ──────────────────────────────────────────
