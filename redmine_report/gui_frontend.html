@@ -134,10 +134,33 @@ html, body {
 
 /* ── Form Elements ──────────────────────────────────── */
 .form-group { display: flex; flex-direction: column; gap: 4px; }
+.form-label-row {
+  display: flex; align-items: center; gap: 6px;
+}
 .form-label {
   font-size: 13px; font-weight: 600;
   color: var(--text-secondary);
   text-transform: none; letter-spacing: .01em;
+}
+.btn-help {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid var(--text-muted);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px; font-weight: 700;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: var(--transition);
+  font-family: var(--font-sans);
+  line-height: 1;
+  padding: 0;
+  -webkit-app-region: no-drag;
+}
+.btn-help:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-light);
 }
 
 .input {
@@ -470,7 +493,7 @@ html, body {
           <button class="btn btn-primary" id="btn-generate" onclick="doGenerate(false)" style="flex:1">
             🚀 生成日报
           </button>
-          <button class="btn btn-secondary" id="btn-copy" onclick="doCopy()" disabled style="flex:1">
+          <button class="btn btn-primary" id="btn-copy" onclick="doCopy()" disabled style="flex:1">
             📋 复制日报
           </button>
         </div>
@@ -498,7 +521,10 @@ html, body {
         </div>
 
         <div class="form-group">
-          <label class="form-label">API Key</label>
+          <div class="form-label-row">
+            <label class="form-label">API Key</label>
+            <button class="btn-help" onclick="showKeyHelp()" title="如何获取 API Key">?</button>
+          </div>
           <div class="btn-row">
             <input type="password" id="cfg-apikey" class="input input-mono" style="flex:1"
               placeholder="输入 API 访问密钥">
@@ -581,7 +607,7 @@ html, body {
           <button class="btn btn-primary btn-sm" onclick="saveConfig()" style="flex:1;font-weight:600;">
             💾 保存设置
           </button>
-          <button class="btn btn-secondary btn-sm" onclick="resetConfig()" style="flex:1;">
+          <button class="btn btn-primary btn-sm" onclick="resetConfig()" style="flex:1;">
             🗑 重置
           </button>
         </div>
@@ -887,6 +913,19 @@ async function resetConfig() {
   } catch(e) {
     toast('重置失败: ' + e.message, 'error');
   }
+}
+
+function showKeyHelp() {
+  const url = $('#cfg-url').value.trim() || '(未填写)';
+  alert(
+    '如何获取 API Key：\n\n' +
+    '1. 打开浏览器登录 Redmine\n' +
+    '2. 点击右上角「我的账号」\n' +
+    '3. 右侧边栏找到「API 访问键」\n' +
+    '4. 点击「显示」复制密钥\n\n' +
+    '服务器地址: ' + url + '\n' +
+    '可在地址后追加 /my/account 直达'
+  );
 }
 
 function toggleKeyVisibility() {

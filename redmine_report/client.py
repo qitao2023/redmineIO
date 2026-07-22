@@ -851,7 +851,7 @@ class RedmineClient:
         timing["build_total"] = round(time.perf_counter() - t_build_start, 2)
 
         return DailyReport(
-            user_name=user_info["login"],
+            user_name=user_info["name"],
             date=report_date,
             weekday_cn=weekday_cn,
             entries=entries,
