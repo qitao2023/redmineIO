@@ -46,16 +46,14 @@ if errorlevel 1 (
     pip install pywin32
 )
 
-echo [构建] 写入构建时间...
-python -c "from datetime import datetime; open('redmine_report/build_time.py','w',encoding='utf-8').write('# Auto-generated\nBUILD_TIME = \"' + datetime.now().strftime('%%Y-%%m-%%d %%H:%%M:%%S') + '\"\n')"
+echo [构建] 生成统一构建时间戳...
+for /f "usebackq delims=" %%i in (`python -c "from datetime import datetime; ts=datetime.now(); open('redmine_report/build_time.py','w',encoding='utf-8').write('# Auto-generated\nBUILD_TIME = \"' + ts.strftime('%%Y-%%m-%%d %%H:%%M:%%S') + '\"\n'); print(ts.strftime('%%Y%%m%%d_%%H%%M%%S'))"`) do set BUILD_DT=%%i
+echo [构建] 构建时间: !BUILD_DT!
 
 echo [构建] 开始打包...
 echo.
 
 pyinstaller redmine_report.spec --clean --noconfirm
-
-REM 获取当前日期时间
-for /f "tokens=1,2 delims= " %%a in ('python -c "from datetime import datetime; print(datetime.now().strftime('%%Y%%m%%d_%%H%%M%%S'))"') do set BUILD_DT=%%a
 
 echo.
 if exist "dist\Redmine日报工具.exe" (

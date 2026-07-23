@@ -3,6 +3,11 @@
 from dataclasses import dataclass, field
 
 
+class CancelledError(Exception):
+    """日报生成被用户取消。"""
+    pass
+
+
 @dataclass
 class IssueEntryData:
     """一条 Issue 记录的结构化数据。"""

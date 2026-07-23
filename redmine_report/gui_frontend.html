@@ -203,6 +203,11 @@ html, body {
 }
 .btn-primary:hover { background: var(--accent-hover); }
 
+.btn-cancel {
+  background: var(--danger); color: var(--text-inverse);
+}
+.btn-cancel:hover { background: #dc2626; }
+
 .btn-secondary {
   background: var(--bg-card); color: var(--text-secondary);
   border-color: var(--border);
@@ -650,6 +655,8 @@ const $$ = (sel) => document.querySelectorAll(sel);
 const state = {
   reportContent: '',
   projectData: [],  // [{id, name, checked}] from fetch
+  currentTaskId: null,  // 当前正在执行的生成任务 ID
+  cancelled: false,     // 用户是否已请求取消
 };
 
 async function api(method, path, body) {
@@ -984,6 +991,11 @@ async function testConnection() {
    ═══════════════════════════════════════════════════════ */
 
 async function doGenerate(showTiming) {
+  // 如果已有任务在运行，先取消
+  if (state.currentTaskId) {
+    await cancelGenerate(state.currentTaskId);
+  }
+
   const url = $('#cfg-url').value.trim();
   const apiKey = $('#cfg-apikey').value.trim();
   const date = $('#report-date').value;
@@ -1001,10 +1013,9 @@ async function doGenerate(showTiming) {
 
   const btnGen = $('#btn-generate');
   const btnCopy = $('#btn-copy');
-  btnGen.disabled = true;
-  btnGen.innerHTML = '<span class="spinner"></span> 启动中...';
   btnCopy.disabled = true;
   setStatus('正在启动生成任务...', true);
+  state.cancelled = false;
 
   const path = showTiming ? '/api/analyze-performance' : '/api/generate';
 
@@ -1020,27 +1031,46 @@ async function doGenerate(showTiming) {
     if (!r.ok) {
       toast(r.error, 'error');
       setStatus('生成失败');
-      btnGen.disabled = false;
       btnGen.innerHTML = '🚀 生成日报';
+      btnGen.className = 'btn btn-primary';
+      btnGen.onclick = () => doGenerate(false);
       btnCopy.disabled = true;
       return;
     }
 
     const taskId = r.data.task_id;
+    state.currentTaskId = taskId;
+
+    // 切换按钮为取消模式
+    btnGen.innerHTML = '⏹ 取消生成';
+    btnGen.className = 'btn btn-cancel';
+    btnGen.onclick = () => cancelGenerate(taskId);
 
     // 2) 轮询进度
     const poll = () => new Promise((resolve, reject) => {
       const _check = async () => {
         try {
+          // 检查是否被用户取消
+          if (state.cancelled) {
+            reject(new Error('用户取消'));
+            return;
+          }
           const pr = await api('GET', `/api/progress/${taskId}`);
           if (!pr.ok) { reject(new Error(pr.error)); return; }
           const { status, progress, pct, result, error } = pr.data;
           setStatus(progress || '处理中...', true);
           if (status === 'done') {
             resolve(result);
+          } else if (status === 'cancelled') {
+            reject(new Error('用户取消'));
           } else if (status === 'error') {
             reject(new Error(error || '生成失败'));
           } else {
+            // 再次检查取消标志
+            if (state.cancelled) {
+              reject(new Error('用户取消'));
+              return;
+            }
             setTimeout(_check, 500);
           }
         } catch(e) { reject(e); }
@@ -1070,13 +1100,34 @@ async function doGenerate(showTiming) {
       : `${summary.total_issues}个问题，耗时${totalTime}s — ${summary.date}`);
     toast(showTiming ? '耗时分析完成！' : `日报生成成功！(耗时${totalTime}s)`);
   } catch(e) {
-    toast('生成失败: ' + e.message, 'error');
-    setStatus('生成失败');
+    const msg = e.message || String(e);
+    if (msg === '用户取消') {
+      toast('日报生成已取消', 'warning');
+      setStatus('已取消');
+    } else {
+      toast('生成失败: ' + msg, 'error');
+      setStatus('生成失败');
+    }
   } finally {
-    btnGen.disabled = false;
     btnGen.innerHTML = '🚀 生成日报';
+    btnGen.className = 'btn btn-primary';
+    btnGen.onclick = () => doGenerate(false);
+    state.currentTaskId = null;
+    state.cancelled = false;
   }
 }
+
+async function cancelGenerate(taskId) {
+  if (!taskId) return;
+  state.cancelled = true;
+  try {
+    await api('POST', `/api/cancel/${taskId}`);
+  } catch(e) {
+    // 忽略网络错误，本地标志已设置
+  }
+  state.currentTaskId = null;
+}
+
 
 /* ═══════════════════════════════════════════════════════
    Preview Rendering

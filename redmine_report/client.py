@@ -16,7 +16,7 @@ from redminelib.exceptions import (
     ResourceNotFoundError,
 )
 
-from .models import DailyReport, IssueEntryData
+from .models import CancelledError, DailyReport, IssueEntryData
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +324,7 @@ class RedmineClient:
         review_strict: bool = False,
         support_always_new: bool = False,
         progress_callback: "callable | None" = None,
+        cancel_check: "callable | None" = None,
         limit: int = 300,
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
@@ -341,6 +342,9 @@ class RedmineClient:
         def _p(msg, pct):
             if progress_callback:
                 progress_callback(msg, pct)
+
+        def _should_cancel():
+            return cancel_check is not None and cancel_check()
 
         t_total_start = time.perf_counter()
 
@@ -403,6 +407,9 @@ class RedmineClient:
         )
         _p(f"filter查询完成，候选{len(candidates)}个", 25)
 
+        if _should_cancel():
+            raise CancelledError("用户取消")
+
         # ── 收集候选 Issue 详情（供调试召回）──
         candidates_detail: list[str] = []
         for issue in candidates:
@@ -455,6 +462,9 @@ class RedmineClient:
         )
         _p(f"预分类完成，待验证{len(need_journal_check)}个", 40)
 
+        if _should_cancel():
+            raise CancelledError("用户取消")
+
         # ═══ 阶段2.5: 搜索 API 预筛 ═══
         t_act_start = time.perf_counter()
         search_issues: set[int] = set()
@@ -481,11 +491,15 @@ class RedmineClient:
         )
 
         # ═══ 阶段3: journal 验证 ═══
+        if _should_cancel():
+            raise CancelledError("用户取消")
+
         result_before_journal = len(result)
         _p(f"正在验证journal（共{len(need_journal_check)}个）...", 55)
         rejected = self._check_journals_concurrent(
             need_journal_check, user_id, report_date, verified, result,
             review_strict=review_strict,
+            cancel_check=cancel_check,
         )
         t4 = time.perf_counter()
         journal_elapsed = t4 - t3
@@ -577,6 +591,7 @@ class RedmineClient:
         result: list[dict[str, Any]],
         max_workers: int = 60,
         review_strict: bool = False,
+        cancel_check: "callable | None" = None,
     ):
         """并发检查 Issue 的 journal，20 线程 + 重试 1 次。
 
@@ -591,6 +606,9 @@ class RedmineClient:
         rejected_debug: list[str] = []  # 被 review_strict 过滤的 Issue
         count_lock = threading.Lock()
         debug_lock = threading.Lock()
+
+        def _should_cancel():
+            return cancel_check is not None and cancel_check()
 
         def _fetch_detailed(issue_id: int) -> tuple[Any, list] | None:
             for attempt in range(1):
@@ -680,6 +698,9 @@ class RedmineClient:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_check_one, iss): iss for iss in issues}
             for future in as_completed(futures):
+                if _should_cancel():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise CancelledError("用户取消")
                 try:
                     data = future.result()
                 except Exception:
@@ -772,6 +793,7 @@ class RedmineClient:
         review_strict: bool = False,
         support_always_new: bool = False,
         progress_callback: "callable | None" = None,
+        cancel_check: "callable | None" = None,
     ) -> DailyReport:
         """编排所有 API 调用，构建完整的 DailyReport 对象。
 
@@ -804,7 +826,8 @@ class RedmineClient:
                                               skip_review=skip_review,
                                               review_strict=review_strict,
                                               support_always_new=support_always_new,
-                                              progress_callback=progress_callback)
+                                              progress_callback=progress_callback,
+                                              cancel_check=cancel_check)
         _p(f"正在生成报告...({len(raw_issues)}个Issue)", 90)
         print(
             f"找到 {len(raw_issues)} 个 Issue（{report_date}）",

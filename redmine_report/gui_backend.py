@@ -19,7 +19,7 @@ from .build_time import BUILD_TIME
 from .client import RedmineClient, RedmineClientError
 from .config import ConfigError, load_config
 from .generator import generate_report
-from .models import DailyReport
+from .models import CancelledError, DailyReport
 
 # ── Flask 应用 ──────────────────────────────────────────
 
@@ -234,7 +234,8 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
                  skip_review: bool, review_strict: bool,
                  support_always_new: bool, report_with_numbers: bool,
                  show_timing: bool,
-                 progress_callback=None) -> dict:
+                 progress_callback=None,
+                 cancel_check=None) -> dict:
     """在后台线程中执行日报生成。"""
     client = RedmineClient(url=url, api_key=api_key)
 
@@ -244,6 +245,7 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         skip_review=skip_review, review_strict=review_strict,
         support_always_new=support_always_new,
         progress_callback=progress_callback,
+        cancel_check=cancel_check,
     )
 
     content = generate_report(
@@ -370,10 +372,12 @@ def _handle_generate(body: dict):
         return _err("请输入报告日期")
 
     task_id = str(_uuid.uuid4())[:8]
+    cancel_event = threading.Event()
     with _task_lock:
         _task_store[task_id] = {"status": "running", "progress": "准备中...",
                                  "pct": 0, "result": None, "error": None,
-                                 "show_timing": show_timing}
+                                 "show_timing": show_timing,
+                                 "cancel_event": cancel_event}
 
     def _run():
         try:
@@ -383,18 +387,28 @@ def _handle_generate(body: dict):
                         _task_store[task_id]["progress"] = msg
                         _task_store[task_id]["pct"] = pct
 
+            def _should_cancel():
+                return cancel_event.is_set()
+
             result = _do_generate(
                 url, api_key, report_date, end_time,
                 project_ids, custom_other,
                 skip_review, review_strict, support_always_new,
                 report_with_numbers, show_timing,
                 progress_callback=_on_progress,
+                cancel_check=_should_cancel,
             )
             with _task_lock:
                 if task_id in _task_store:
                     _task_store[task_id]["status"] = "done"
                     _task_store[task_id]["result"] = result
                     _task_store[task_id]["pct"] = 100
+        except CancelledError:
+            with _task_lock:
+                if task_id in _task_store:
+                    _task_store[task_id]["status"] = "cancelled"
+                    _task_store[task_id]["progress"] = "已取消"
+                    _task_store[task_id]["pct"] = 0
         except RedmineClientError as e:
             with _task_lock:
                 if task_id in _task_store:
@@ -427,6 +441,22 @@ def api_progress(task_id):
         "error": task.get("error"),
         "show_timing": task.get("show_timing", False),
     })
+
+
+@app.route("/api/cancel/<task_id>", methods=["POST"])
+def api_cancel(task_id):
+    """取消正在执行的异步生成任务。"""
+    with _task_lock:
+        task = _task_store.get(task_id)
+    if task is None:
+        return _err("任务不存在或已过期")
+    if task["status"] != "running":
+        return _ok({"message": "任务不在运行中，无需取消"})
+    cancel_event = task.get("cancel_event")
+    if cancel_event is not None:
+        cancel_event.set()
+    task["progress"] = "正在取消..."
+    return _ok({"message": "已发送取消请求，正在终止..."})
 
 
 # 定期清理过期任务
