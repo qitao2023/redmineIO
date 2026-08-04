@@ -98,6 +98,15 @@ class Config:
             "review_strict": True,  # True=审核复核仅计入状态/指派变更，纯评论不算
             "support_always_new": False,  # True=支持类Issue始终显示初始状态（新建）
             "report_with_numbers": True,  # True=节号带数量 + issue带序号
+            # RocketChat 发送设置
+            "rc_url": "",  # RocketChat 服务器地址
+            "rc_username": "",  # 登录用户名
+            "rc_password": "",  # 登录密码
+            "rc_rooms": [],  # 已保存的房间列表 [{rid, name, type, checked}]
+            "rc_enabled": True,  # True=发送时启用 RocketChat
+            # 工作日志文件
+            "log_file": False,  # True=发送时同步写入工作日志文件
+            "log_file_path": r"D:\66-工作日志\工作日志 -2026.txt",  # 工作日志文件路径
         }
 
     def _find_config(self) -> Path | None:
@@ -150,6 +159,27 @@ class Config:
         # 项目名称映射（用于离线还原列表）
         if "project_names" in raw:
             self.data["project_names"] = raw["project_names"]
+
+        # RocketChat 发送设置
+        if "rocketchat" in raw:
+            rc = raw["rocketchat"]
+            if "url" in rc:
+                self.data["rc_url"] = rc["url"]
+            if "username" in rc:
+                self.data["rc_username"] = rc["username"]
+            if "password" in rc:
+                self.data["rc_password"] = rc["password"]
+            if "rooms" in rc:
+                self.data["rc_rooms"] = rc["rooms"]
+        for key in ("rc_url", "rc_username", "rc_password", "rc_rooms"):
+            if key in raw and raw[key]:
+                self.data[key] = raw[key]
+        if "rc_enabled" in raw:
+            self.data["rc_enabled"] = raw["rc_enabled"]
+        if "log_file" in raw:
+            self.data["log_file"] = raw["log_file"]
+        if "log_file_path" in raw:
+            self.data["log_file_path"] = raw["log_file_path"]
 
     def _apply_env_overrides(self) -> None:
         env_map = {
@@ -223,6 +253,44 @@ class Config:
     def report_with_numbers(self) -> bool:
         """日报是否在节号后显示数量，issue 前带序号。"""
         return bool(self.data.get("report_with_numbers", False))
+
+    @property
+    def rc_url(self) -> str:
+        """RocketChat 服务器地址。"""
+        return str(self.data.get("rc_url", ""))
+
+    @property
+    def rc_username(self) -> str:
+        """RocketChat 登录用户名。"""
+        return str(self.data.get("rc_username", ""))
+
+    @property
+    def rc_password(self) -> str:
+        """RocketChat 登录密码。"""
+        return str(self.data.get("rc_password", ""))
+
+    @property
+    def rc_rooms(self) -> list[dict]:
+        """已保存的 RocketChat 房间列表 [{rid, name, type, checked}]。"""
+        rooms = self.data.get("rc_rooms", [])
+        if not isinstance(rooms, list):
+            return []
+        return [r for r in rooms if isinstance(r, dict)]
+
+    @property
+    def rc_enabled(self) -> bool:
+        """是否启用 RocketChat 发送。"""
+        return bool(self.data.get("rc_enabled", True))
+
+    @property
+    def log_file(self) -> bool:
+        """是否在发送时同步写入工作日志文件。"""
+        return bool(self.data.get("log_file", False))
+
+    @property
+    def log_file_path(self) -> str:
+        """工作日志文件路径。"""
+        return str(self.data.get("log_file_path", ""))
 
 
 def load_config(

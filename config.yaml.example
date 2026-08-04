@@ -29,3 +29,17 @@ requests_timeout: 30
 
 # 跳过审核/复核（只查本人创建/经办的 Issue，大幅提速）
 skip_review: false
+
+# RocketChat 发送设置（在 GUI 设置页中配置，可留空）
+# rocketchat:
+#   url: "http://192.168.0.83:3009"
+#   username: ""
+#   password: ""
+#   # 已保存的频道/群组列表（GUI 中勾选后自动写入）
+#   rooms: []
+#   # 是否启用 RocketChat 发送（默认 true）
+#   rc_enabled: true
+
+# 工作日志文件（发送时同步追加，条目之间空两行）
+# log_file: false
+# log_file_path: 'D:\66-工作日志\工作日志 -2026.txt'

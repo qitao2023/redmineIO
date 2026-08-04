@@ -20,6 +20,7 @@ from .client import RedmineClient, RedmineClientError
 from .config import ConfigError, load_config
 from .generator import generate_report
 from .models import CancelledError, DailyReport
+from .rocketchat import RocketChatClient, RocketChatClientError
 
 # ── Flask 应用 ──────────────────────────────────────────
 
@@ -106,6 +107,15 @@ def api_load_config():
         "review_strict": data.get("review_strict", True),
         "support_always_new": data.get("support_always_new", False),
         "report_with_numbers": data.get("report_with_numbers", True),
+        # RocketChat 发送设置
+        "rc_url": data.get("rc_url", ""),
+        "rc_username": data.get("rc_username", ""),
+        "rc_password": data.get("rc_password", ""),
+        "rc_rooms": data.get("rc_rooms", []) or [],
+        "rc_enabled": data.get("rc_enabled", True),
+        # 工作日志文件
+        "log_file": data.get("log_file", False),
+        "log_file_path": data.get("log_file_path", ""),
     })
 
 
@@ -134,6 +144,15 @@ def api_save_config():
         "review_strict": body.get("review_strict", True),
         "support_always_new": body.get("support_always_new", False),
         "report_with_numbers": body.get("report_with_numbers", True),
+        # RocketChat 发送设置
+        "rc_url": body.get("rc_url", "").strip(),
+        "rc_username": body.get("rc_username", "").strip(),
+        "rc_password": body.get("rc_password", ""),
+        "rc_rooms": body.get("rc_rooms", []) or [],
+        "rc_enabled": body.get("rc_enabled", True),
+        # 工作日志文件
+        "log_file": body.get("log_file", False),
+        "log_file_path": body.get("log_file_path", "").strip(),
     }
 
     try:
@@ -225,6 +244,137 @@ def api_fetch_projects():
         return _err(f"获取失败: {e}")
     except Exception as e:
         return _err(f"未知错误: {str(e)[:200]}")
+
+
+# ── RocketChat 发送 API ─────────────────────────────────
+
+def _rc_client_from_body(body: dict) -> RocketChatClient:
+    """从请求体构造 RocketChatClient（未登录）。"""
+    url = body.get("url", "").strip()
+    username = body.get("username", "").strip()
+    password = body.get("password", "")
+    if not url:
+        raise RocketChatClientError("请输入 RocketChat 服务器地址")
+    if not username:
+        raise RocketChatClientError("请输入 RocketChat 用户名")
+    if not password:
+        raise RocketChatClientError("请输入 RocketChat 密码")
+    return RocketChatClient(url=url, username=username, password=password)
+
+
+@app.route("/api/rc/test", methods=["POST"])
+def api_rc_test():
+    """测试 RocketChat 连接：登录 + 拉取房间。"""
+    try:
+        client = _rc_client_from_body(request.get_json(force=True))
+        user = client.login()
+        rooms = client.list_rooms()
+        return _ok({
+            "success": True,
+            "message": (
+                f"✓ RocketChat 连接成功\n"
+                f"用户: {user.get('name') or user.get('username')} "
+                f"({user.get('username')})\n"
+                f"可发送 {len(rooms)} 个频道/群组"
+            ),
+            "user": user,
+            "rooms": rooms,
+            "room_count": len(rooms),
+        })
+    except RocketChatClientError as e:
+        return _ok({
+            "success": False,
+            "message": f"连接失败\n\n{str(e)}",
+            "user": None,
+            "rooms": [],
+            "room_count": 0,
+        })
+    except Exception as e:
+        return _ok({
+            "success": False,
+            "message": f"未知错误\n\n{str(e)[:300]}",
+            "user": None,
+            "rooms": [],
+            "room_count": 0,
+        })
+
+
+@app.route("/api/rc/rooms", methods=["POST"])
+def api_rc_rooms():
+    """拉取 RocketChat 房间列表（刷新）。"""
+    try:
+        client = _rc_client_from_body(request.get_json(force=True))
+        client.login()
+        rooms = client.list_rooms()
+        rooms.sort(key=lambda r: (r["type"], r["name"]))
+        return _ok({"rooms": rooms})
+    except RocketChatClientError as e:
+        return _err(f"获取失败: {e}")
+    except Exception as e:
+        return _err(f"未知错误: {str(e)[:200]}")
+
+
+def _append_to_log_file(path: str, content: str) -> dict:
+    """将日报内容追加到工作日志文件，条目之间空两行。"""
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        text = content.rstrip("\n") + "\n"
+        need_gap = p.exists() and p.stat().st_size > 0
+        with open(p, "a", encoding="utf-8") as f:
+            if need_gap:
+                f.write("\n\n")
+            f.write(text)
+        return {"ok": True, "path": str(p)}
+    except Exception as e:
+        return {"ok": False, "path": path, "error": str(e)}
+
+
+@app.route("/api/rc/send", methods=["POST"])
+def api_rc_send():
+    """发送日报到指定的 RocketChat 房间；勾选时同步追加到工作日志文件。"""
+    body = request.get_json(force=True)
+    rooms = body.get("rooms", []) or []
+    content = body.get("content", "")
+    log_to_file = body.get("log_to_file", False)
+    log_file_path = body.get("log_file_path", "").strip()
+
+    if not rooms and not log_to_file:
+        return _err("请先勾选要发送的频道/群组，或勾选「同时写入工作日志」")
+    if not content:
+        return _err("没有可发送的内容")
+
+    results = []
+    # RocketChat 发送
+    if rooms:
+        try:
+            client = _rc_client_from_body(body)
+            client.login()
+            for room in rooms:
+                rid = room.get("rid", "")
+                name = room.get("name", "")
+                if not rid:
+                    results.append({
+                        "rid": rid, "name": name, "ok": False,
+                        "error": "缺少房间 ID",
+                    })
+                    continue
+                try:
+                    client.post_message(rid, content)
+                    results.append({"rid": rid, "name": name, "ok": True, "error": None})
+                except RocketChatClientError as e:
+                    results.append({"rid": rid, "name": name, "ok": False, "error": str(e)})
+        except RocketChatClientError as e:
+            return _err(f"发送失败: {e}")
+        except Exception as e:
+            return _err(f"未知错误: {str(e)[:300]}")
+
+    # 写入工作日志文件
+    file_result = None
+    if log_to_file:
+        file_result = _append_to_log_file(log_file_path, content)
+
+    return _ok({"results": results, "file": file_result})
 
 
 # ── 日报生成 API ────────────────────────────────────────
