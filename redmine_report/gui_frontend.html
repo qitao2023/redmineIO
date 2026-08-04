@@ -1091,14 +1091,20 @@ async function doGenerate(showTiming) {
 
     const timingStr = (showTiming && summary.timing && summary.timing.build_total)
       ? ` | 总耗时${summary.timing.build_total}s` : '';
+    const warnings = summary.warnings || [];
+    const warnMark = warnings.length ? ' | ⚠ 有抓取失败' : '';
     $('#preview-summary').textContent =
-      `用户: ${summary.user_name} | 问题: ${summary.total_issues}个 | 项目: ${summary.project_count}个${timingStr}`;
+      `用户: ${summary.user_name} | 问题: ${summary.total_issues}个 | 项目: ${summary.project_count}个${timingStr}${warnMark}`;
 
     const totalTime = summary.timing?.build_total || '?';
     setStatus(showTiming
       ? `${summary.total_issues}个问题，总耗时${totalTime}s — ${summary.date}`
       : `${summary.total_issues}个问题，耗时${totalTime}s — ${summary.date}`);
-    toast(showTiming ? '耗时分析完成！' : `日报生成成功！(耗时${totalTime}s)`);
+    if (warnings.length) {
+      warnings.forEach(w => toast('⚠ ' + w, 'warning'));
+    } else {
+      toast(showTiming ? '耗时分析完成！' : `日报生成成功！(耗时${totalTime}s)`);
+    }
   } catch(e) {
     const msg = e.message || String(e);
     if (msg === '用户取消') {

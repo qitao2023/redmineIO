@@ -210,6 +210,12 @@ def main(
         click.secho(str(e), fg="red", err=True)
         sys.exit(1)
 
+    # 抓取失败警告（报告可能不完整）
+    if getattr(report, "warnings", []):
+        click.secho("⚠ 抓取失败，报告可能不完整：", fg="red", err=True)
+        for w in report.warnings:
+            click.secho(f"  {w}", fg="red", err=True)
+
     # 8. --dry-run
     if dry_run:
         click.echo(f"\n=== 数据摘要 ({date}) ===")

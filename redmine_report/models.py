@@ -37,3 +37,4 @@ class DailyReport:
     current_user_id: int = 0  # 当前用户 ID，用于判断复测/复核
     report_date: str = ""  # 报告日期 YYYY-MM-DD，用于判断是否当日创建
     timing: dict = field(default_factory=dict)  # 各阶段耗时统计
+    warnings: list[str] = field(default_factory=list)  # 抓取失败等警告，报告可能不完整

@@ -26,6 +26,17 @@ _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周�
 # 预计算北京时间时区，避免每次调用时重复创建
 _BEIJING_TZ = _tz(timedelta(hours=8))
 
+# 并发参数
+_FILTER_WORKERS = 8          # 阶段1: 项目 filter 查询并发数
+_NEW_ISSUE_WORKERS = 20      # 阶段2: 新增 Issue 详情抓取并发数
+
+# 跨实例共享的状态映射缓存（GUI 每次生成都新建 RedmineClient，缓存避免重复拉取）
+_STATUS_MAP_CACHE: dict[tuple[str, str], dict[str, str]] = {}
+_STATUS_MAP_CACHE_LOCK = threading.Lock()
+
+# 复用的 requests 会话（keep-alive），供搜索 API 使用
+_SEARCH_SESSION = _requests.Session()
+
 
 class RedmineClientError(Exception):
     """Redmine 客户端错误。"""
@@ -41,6 +52,7 @@ class RedmineClient:
         self._redmine: Redmine | None = None
         self._last_timing: dict = {}
         self._status_map: dict[str, str] | None = None  # status_id → status_name
+        self._status_map_lock = threading.Lock()  # 状态映射懒加载的并发保护
 
         try:
             self._redmine = Redmine(
@@ -81,16 +93,27 @@ class RedmineClient:
             raise RedmineClientError(f"认证过程出错: {str(e)[:200]}") from e
 
     def _ensure_status_map(self) -> None:
-        """懒加载 status_id → status_name 映射。"""
+        """懒加载 status_id → status_name 映射（线程安全，跨实例缓存）。"""
         if self._status_map is not None:
             return
-        self._status_map = {}
-        try:
-            for s in self._redmine.issue_status.all():
-                self._status_map[str(s.id)] = s.name
-            logger.info("状态映射已加载: %d 个状态", len(self._status_map))
-        except Exception as e:
-            logger.warning("批量加载状态映射失败: %s，将按需单条查询", str(e)[:120])
+        cache_key = (self.url, self._api_key)
+        with _STATUS_MAP_CACHE_LOCK:
+            cached = _STATUS_MAP_CACHE.get(cache_key)
+        if cached is not None:
+            self._status_map = dict(cached)
+            return
+        with self._status_map_lock:
+            if self._status_map is not None:
+                return
+            self._status_map = {}
+            try:
+                for s in self._redmine.issue_status.all():
+                    self._status_map[str(s.id)] = s.name
+                logger.info("状态映射已加载: %d 个状态", len(self._status_map))
+                with _STATUS_MAP_CACHE_LOCK:
+                    _STATUS_MAP_CACHE[cache_key] = dict(self._status_map)
+            except Exception as e:
+                logger.warning("批量加载状态映射失败: %s，将按需单条查询", str(e)[:120])
 
     def _lookup_status(self, status_id: str) -> str:
         """按 status_id 查名称，缓存未命中时按需单条查询。"""
@@ -220,7 +243,7 @@ class RedmineClient:
         url = f"{self.url}/search.json"
         debug_parts = [f"URL: {url}?q={q}&issues=1"]
         try:
-            resp = _requests.get(
+            resp = _SEARCH_SESSION.get(
                 url,
                 params={
                     "q": q,
@@ -326,6 +349,7 @@ class RedmineClient:
         progress_callback: "callable | None" = None,
         cancel_check: "callable | None" = None,
         limit: int = 300,
+        debug_journals: bool = False,
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
 
@@ -337,6 +361,8 @@ class RedmineClient:
             skip_review: True=跳过方案3（不查审核复核），大幅提速。
             review_strict: True=审核复核仅计入状态/指派变更，纯评论不算。
             limit: 单次查询返回上限（仅用于覆盖 Redmine 默认 25 条分页限制）。
+            debug_journals: True=额外抓取前 3 条已确认 Issue 的 journal 原文用于调试
+                            （默认 False，省 3 次串行网络请求）。
         """
         # project_ids 为空时：方案3 回退到原来的全站查询（不额外调用 membership API）
         def _p(msg, pct):
@@ -351,9 +377,11 @@ class RedmineClient:
         seen: set[int] = set()
         candidates: list = []
         seen_lock = threading.Lock()
+        query_failures = 0  # 阶段1: 整批 filter 查询失败次数（该查询的 Issue 可能全部缺失）
 
         def _query_date(date_str, **extra_filters):
             """查询全站 Issue（无项目限定时使用）。"""
+            nonlocal query_failures
             try:
                 for issue in self._redmine.issue.filter(
                     updated_on=date_str,
@@ -367,11 +395,24 @@ class RedmineClient:
                             seen.add(issue.id)
                             candidates.append(issue)
             except BaseRedmineError as e:
+                with seen_lock:
+                    query_failures += 1
                 logger.warning("查询 %s 失败: %s", date_str, str(e)[:100])
 
         # ═══ 阶段1: 并行 filter 查询 ═══
         t1 = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=8) as executor:
+
+        # 提前发起搜索 API 预筛（独立线程，与阶段1 并行，阶段2.5 再汇合）
+        search_holder: dict[str, object] = {"issues": set(), "error": "", "debug": ""}
+        search_thread: threading.Thread | None = None
+        if user_name:
+            def _run_search():
+                search_holder["issues"], search_holder["error"], search_holder["debug"] = \
+                    self._search_user_issues(user_name, report_date)
+            search_thread = threading.Thread(target=_run_search, daemon=True)
+            search_thread.start()
+
+        with ThreadPoolExecutor(max_workers=_FILTER_WORKERS) as executor:
             if project_ids:
                 futures = []
                 for pid in project_ids:
@@ -395,8 +436,9 @@ class RedmineClient:
             for future in as_completed(futures):
                 try:
                     future.result()
-                except Exception:
-                    pass
+                except Exception as e:
+                    query_failures += 1
+                    logger.warning("filter 查询发生未预期错误: %s", str(e)[:100])
         t2 = time.perf_counter()
         filter_elapsed = t2 - t1
         query_count = len(futures)
@@ -420,39 +462,54 @@ class RedmineClient:
         result: list[dict[str, Any]] = []
         verified: set[int] = set()
         need_journal_check: list = []
+        new_issues: list = []
 
         for issue in candidates:
             author_id = getattr(issue.author, "id", 0) if hasattr(issue, "author") else 0
-            status_name = getattr(issue.status, "name", "")
-            tracker_name = getattr(issue.tracker, "name", "")
             created_on = self._to_beijing_date(getattr(issue, "created_on", None))
-
-            # 新增 — 本人创建 + 当天创建
-            # "支持"类：不限状态，始终取创建时的初始状态
-            # 其他类：取当事人最后一次操作时的有效状态
+            # 新增 — 本人创建 + 当天创建；其余 Issue 需要 journal 验证
             if author_id == user_id and created_on == report_date:
-                status_override = ""
-                if support_always_new and tracker_name and "支持" in tracker_name:
-                    # 支持类 + 开关开启：从历史记录反推初始状态
-                    try:
-                        detailed = self._redmine.issue.get(issue.id, include="journals")
-                        status_override = self._get_initial_status(detailed)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        detailed = self._redmine.issue.get(issue.id, include="journals")
-                        status_override = self._get_effective_status(detailed, user_id, report_date)
-                    except Exception:
-                        pass
-                data = self._extract_issue_data(issue, status_override=status_override)
-                if data["issue_id"] not in verified:
-                    verified.add(data["issue_id"])
-                    result.append(data)
-                continue
+                new_issues.append(issue)
+            else:
+                need_journal_check.append(issue)
 
-            # 其余 Issue 需要 journal 验证
-            need_journal_check.append(issue)
+        # 新增 Issue 的详情抓取是相互独立的 I/O，并行化（判定逻辑不变）。
+        # "支持"类：不限状态，始终取创建时的初始状态；其他类：取当事人最后一次操作时的有效状态。
+        new_detail_failures = 0  # 阶段2: 新增 Issue 详情抓取失败次数
+        new_detail_lock = threading.Lock()
+
+        def _compute_new_status(issue):
+            """抓取新增 Issue 的 journals 并计算其有效状态。"""
+            nonlocal new_detail_failures
+            tracker_name = getattr(issue.tracker, "name", "")
+            status_override = ""
+            try:
+                detailed = self._redmine.issue.get(issue.id, include="journals")
+            except Exception:
+                with new_detail_lock:
+                    new_detail_failures += 1
+                return issue, ""
+            try:
+                if support_always_new and tracker_name and "支持" in tracker_name:
+                    status_override = self._get_initial_status(detailed)
+                else:
+                    status_override = self._get_effective_status(detailed, user_id, report_date)
+            except Exception:
+                pass
+            return issue, status_override
+
+        if new_issues:
+            with ThreadPoolExecutor(max_workers=_NEW_ISSUE_WORKERS) as executor:
+                futures = [executor.submit(_compute_new_status, iss) for iss in new_issues]
+                for future in as_completed(futures):
+                    try:
+                        issue, status_override = future.result()
+                    except Exception:
+                        continue
+                    data = self._extract_issue_data(issue, status_override=status_override)
+                    if data["issue_id"] not in verified:
+                        verified.add(data["issue_id"])
+                        result.append(data)
 
         t3 = time.perf_counter()
         print(
@@ -465,13 +522,16 @@ class RedmineClient:
         if _should_cancel():
             raise CancelledError("用户取消")
 
-        # ═══ 阶段2.5: 搜索 API 预筛 ═══
+        # ═══ 阶段2.5: 搜索 API 预筛（已在阶段1 并发执行，这里汇合） ═══
         t_act_start = time.perf_counter()
         search_issues: set[int] = set()
         search_error = ""
         search_debug = ""
-        if user_name:
-            search_issues, search_error, search_debug = self._search_user_issues(user_name, report_date)
+        if search_thread is not None:
+            search_thread.join()
+        search_issues = set(search_holder["issues"])
+        search_error = str(search_holder["error"])
+        search_debug = str(search_holder["debug"])
         skipped_by_search = 0
         if search_issues:
             filtered = []
@@ -496,7 +556,7 @@ class RedmineClient:
 
         result_before_journal = len(result)
         _p(f"正在验证journal（共{len(need_journal_check)}个）...", 55)
-        rejected = self._check_journals_concurrent(
+        rejected, journal_failures = self._check_journals_concurrent(
             need_journal_check, user_id, report_date, verified, result,
             review_strict=review_strict,
             cancel_check=cancel_check,
@@ -513,9 +573,9 @@ class RedmineClient:
 
         result.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
 
-        # ── 调试：抓一条已确认 Issue 的 journal 原始内容 ──
+        # ── 调试：抓已确认 Issue 的 journal 原始内容（仅 debug_journals=True 时）──
         journal_debug: list[str] = []
-        for entry in result[:3]:
+        for entry in (result[:3] if debug_journals else []):
             try:
                 detail = self._redmine.issue.get(entry["issue_id"], include="journals")
                 journal_debug.append(f"--- Issue #{entry['issue_id']} journals ---")
@@ -572,6 +632,11 @@ class RedmineClient:
             "journal_rejected": (rejected or []) if review_strict else [],
             "total": round(t_total, 2),
             "journal_debug": journal_debug,
+            "fetch_failures": {
+                "filter": query_failures,
+                "new_detail": new_detail_failures,
+                "journal": journal_failures,
+            },
         }
         self._last_timing = timing
         print(
@@ -598,11 +663,11 @@ class RedmineClient:
         review_strict=True 时：仅计入状态或指派变更，纯评论忽略。
         """
         if not issues:
-            return []
+            return [], 0
 
         t0 = time.perf_counter()
         total_fetched = 0
-        total_failed = 0
+        total_failed = 0  # journal 抓取失败、被丢弃的 Issue 数
         rejected_debug: list[str] = []  # 被 review_strict 过滤的 Issue
         count_lock = threading.Lock()
         debug_lock = threading.Lock()
@@ -616,7 +681,7 @@ class RedmineClient:
                     detailed = self._redmine.issue.get(issue_id, include="journals")
                     journals = list(getattr(detailed, "journals", []))
                     return detailed, journals
-                except BaseRedmineError:
+                except Exception:
                     if attempt < 1:
                         continue
             return None
@@ -716,7 +781,7 @@ class RedmineClient:
             f"成功{total_fetched}/失败{total_failed}，均{avg_per:.2f}s/个）",
             file=sys.stderr,
         )
-        return rejected_debug
+        return rejected_debug, total_failed
 
     def _extract_issue_data(self, issue: Any, status_override: str = "") -> dict[str, Any]:
         """从 Issue 资源提取结构化数据。
@@ -792,6 +857,7 @@ class RedmineClient:
         skip_review: bool = False,
         review_strict: bool = False,
         support_always_new: bool = False,
+        debug_journals: bool = False,
         progress_callback: "callable | None" = None,
         cancel_check: "callable | None" = None,
     ) -> DailyReport:
@@ -803,6 +869,7 @@ class RedmineClient:
             skip_review: True=跳过方案3（审核复核），大幅提速。
             review_strict: True=审核复核仅计入状态/指派变更，纯评论不算。
             support_always_new: True=支持类Issue始终显示初始状态（新建）。
+            debug_journals: True=额外抓取已确认 Issue 的 journal 原文用于调试。
             progress_callback: 进度回调 (msg, percent)。
         """
         t_build_start = time.perf_counter()
@@ -826,6 +893,7 @@ class RedmineClient:
                                               skip_review=skip_review,
                                               review_strict=review_strict,
                                               support_always_new=support_always_new,
+                                              debug_journals=debug_journals,
                                               progress_callback=progress_callback,
                                               cancel_check=cancel_check)
         _p(f"正在生成报告...({len(raw_issues)}个Issue)", 90)
@@ -873,6 +941,22 @@ class RedmineClient:
         timing["auth"] = round(auth_elapsed, 2)
         timing["build_total"] = round(time.perf_counter() - t_build_start, 2)
 
+        # 抓取失败警告：报告可能不完整（纯文本，避免 GBK 控制台打印崩溃）
+        warnings: list[str] = []
+        ff = timing.get("fetch_failures", {})
+        if ff.get("filter"):
+            warnings.append(
+                f"有 {ff['filter']} 次项目查询失败，对应项目的 Issue 可能未收录"
+            )
+        if ff.get("journal"):
+            warnings.append(
+                f"有 {ff['journal']} 个 Issue 的日志抓取失败，对应记录可能缺失"
+            )
+        if ff.get("new_detail"):
+            warnings.append(
+                f"有 {ff['new_detail']} 个新增 Issue 详情抓取失败，状态可能不准确"
+            )
+
         return DailyReport(
             user_name=user_info["name"],
             date=report_date,
@@ -883,4 +967,5 @@ class RedmineClient:
             current_user_id=user_id,
             report_date=report_date,
             timing=timing,
+            warnings=warnings,
         )

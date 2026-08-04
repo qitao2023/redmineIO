@@ -983,7 +983,8 @@ class RedmineReportApp(ctk.CTk):
             proj_ids = project_ids if project_ids else None
             report = client.build_report_data(report_date, project_ids=proj_ids,
                                                skip_review=skip_review,
-                                               review_strict=review_strict)
+                                               review_strict=review_strict,
+                                               debug_journals=show_timing)
 
             # 生成 Markdown
             self._after_status("正在生成日报...")
@@ -1065,6 +1066,16 @@ class RedmineReportApp(ctk.CTk):
             ]
             for line in lines:
                 self.preview_text.insert("end", line + "\n")
+            # 抓取失败明细（明确哪个环节失败）
+            ff = timing.get("fetch_failures") or {}
+            if any(ff.values()):
+                self.preview_text.insert("end", "\n──────── 抓取失败 ────────\n")
+                if ff.get("filter"):
+                    self.preview_text.insert("end", f"  项目 filter 查询失败: {ff['filter']} 次（对应项目的 Issue 可能未收录）\n")
+                if ff.get("new_detail"):
+                    self.preview_text.insert("end", f"  新增 Issue 详情抓取失败: {ff['new_detail']} 个（状态可能不准确）\n")
+                if ff.get("journal"):
+                    self.preview_text.insert("end", f"  journal 抓取失败: {ff['journal']} 个（对应记录可能缺失）\n")
             candidates = timing.get("candidates_detail", [])
             if candidates:
                 self.preview_text.insert("end", "\n")
@@ -1102,6 +1113,15 @@ class RedmineReportApp(ctk.CTk):
             f"{timing_str}"
         )
         self.summary_label.configure(text=summary)
+
+        # 抓取失败警告（报告可能不完整）
+        warnings = getattr(report, "warnings", [])
+        if warnings:
+            self.summary_label.configure(
+                text=summary + "\n⚠ 有抓取失败，报告可能不完整"
+            )
+            self._set_status("日报已生成，但有抓取失败 ⚠")
+            messagebox.showwarning("抓取失败提示", "\n".join(warnings))
 
         # 恢复 UI
         self.generate_btn.configure(state="normal", text="🚀 生成日报")

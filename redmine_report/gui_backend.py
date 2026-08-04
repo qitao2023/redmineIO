@@ -244,6 +244,7 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         report_date, project_ids=proj_ids,
         skip_review=skip_review, review_strict=review_strict,
         support_always_new=support_always_new,
+        debug_journals=show_timing,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
     )
@@ -287,6 +288,18 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         lines.append("─────────────────────────")
         lines.append(f"总耗时:        {timing.get('build_total', timing.get('total', '?'))}s")
 
+        # 抓取失败明细（明确哪个环节失败）
+        ff = timing.get("fetch_failures") or {}
+        if any(ff.values()):
+            lines.append("")
+            lines.append("──────── 抓取失败 ────────")
+            if ff.get("filter"):
+                lines.append(f"  项目 filter 查询失败: {ff['filter']} 次（对应项目的 Issue 可能未收录）")
+            if ff.get("new_detail"):
+                lines.append(f"  新增 Issue 详情抓取失败: {ff['new_detail']} 个（状态可能不准确）")
+            if ff.get("journal"):
+                lines.append(f"  journal 抓取失败: {ff['journal']} 个（对应记录可能缺失）")
+
         # 候选 Issue 详情
         candidates = timing.get("candidates_detail", [])
         if candidates:
@@ -327,6 +340,7 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         "total_issues": report.total_issues,
         "project_count": report.project_count,
         "timing": timing,
+        "warnings": getattr(report, "warnings", []),
     }
 
     return {
