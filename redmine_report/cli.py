@@ -114,6 +114,7 @@ def main(
             url=cfg.redmine_url,
             api_key=cfg.api_key,
             timeout=cfg.requests_timeout,
+            report_cache_ttl=cfg.report_cache_ttl,
         )
     except RedmineClientError as e:
         click.secho(str(e), fg="red", err=True)

@@ -122,6 +122,7 @@ def api_load_config():
         "review_strict": data.get("review_strict", True),
         "support_always_new": data.get("support_always_new", False),
         "report_with_numbers": data.get("report_with_numbers", True),
+        "report_cache_ttl": data.get("report_cache_ttl", 60),
         # RocketChat 发送设置
         "rc_url": data.get("rc_url", ""),
         "rc_username": data.get("rc_username", ""),
@@ -159,6 +160,7 @@ def api_save_config():
         "review_strict": body.get("review_strict", True),
         "support_always_new": body.get("support_always_new", False),
         "report_with_numbers": body.get("report_with_numbers", True),
+        "report_cache_ttl": body.get("report_cache_ttl", 60),
         # RocketChat 发送设置
         "rc_url": body.get("rc_url", "").strip(),
         "rc_username": body.get("rc_username", "").strip(),
@@ -400,10 +402,14 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
                  support_always_new: bool, report_with_numbers: bool,
                  show_timing: bool,
                  extra_issue_ids: list[int] | None = None,
+                 report_cache_ttl: int = 60,
                  progress_callback=None,
                  cancel_check=None) -> dict:
     """在后台线程中执行日报生成。"""
-    client = RedmineClient(url=url, api_key=api_key)
+    client = RedmineClient(
+        url=url, api_key=api_key,
+        report_cache_ttl=report_cache_ttl,
+    )
 
     proj_ids = project_ids if project_ids else None
     report = client.build_report_data(
@@ -431,7 +437,9 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         lines.append("──────── 耗时统计 ────────")
         if timing.get("report_cache_hit"):
             lines.append(
-                "数据来源:      历史日报缓存（2分钟内复用，未重新请求 Redmine）"
+                f"数据来源:      历史日报缓存"
+                f"（{timing.get('report_cache_ttl', '?')}秒内复用，"
+                f"未重新请求 Redmine）"
             )
         lines.append(f"认证:          {timing.get('auth', '?')}s")
         lines.append(
@@ -597,6 +605,11 @@ def _handle_generate(body: dict):
     support_always_new = body.get("support_always_new", False)
     report_with_numbers = body.get("report_with_numbers", False)
     show_timing = body.get("show_timing", False)
+    try:
+        report_cache_ttl = int(body.get("report_cache_ttl", 60))
+    except (TypeError, ValueError):
+        report_cache_ttl = 60
+    report_cache_ttl = max(0, min(3600, report_cache_ttl))
     # 诊断补录只属于「耗时分析」，正常生成日报时强制忽略。
     extra_issue_ids = (
         _parse_issue_ids(body.get("extra_issues", ""))
@@ -633,6 +646,7 @@ def _handle_generate(body: dict):
                 skip_review, review_strict, support_always_new,
                 report_with_numbers, show_timing,
                 extra_issue_ids=extra_issue_ids,
+                report_cache_ttl=report_cache_ttl,
                 progress_callback=_on_progress,
                 cancel_check=_should_cancel,
             )

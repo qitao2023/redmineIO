@@ -607,6 +607,20 @@ html, body {
         </div>
 
         <div class="form-group">
+          <label class="form-label">历史日报缓存（秒）</label>
+          <div class="btn-row">
+            <input type="number" id="cfg-report-cache-ttl" class="input"
+              min="0" max="3600" step="10" value="60" style="flex:1">
+            <span style="font-size:11px; color:var(--text-muted); align-self:center;">
+              0=关闭，默认60
+            </span>
+          </div>
+          <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
+            同一历史日期/项目在此时间内重复生成时，直接复用上一次结果。
+          </div>
+        </div>
+
+        <div class="form-group">
           <label class="form-label">诊断补充 Issue（可选）</label>
           <input type="text" id="extra-issues" class="input input-mono"
             placeholder="如 110203，多个用逗号分隔">
@@ -782,6 +796,7 @@ async function init() {
       $('#cfg-review-strict').checked = d.review_strict;
       $('#cfg-support-always-new').checked = d.support_always_new;
       $('#cfg-report-numbers').checked = d.report_with_numbers;
+      $('#cfg-report-cache-ttl').value = d.report_cache_ttl ?? 60;
 
       // Restore project list from saved data
       if (d.projects && d.projects.length > 0) {
@@ -818,7 +833,7 @@ async function init() {
 
   // Auto-save on input change (500ms debounce)
   let saveTimer;
-  const autoSaveInputs = ['#cfg-url', '#cfg-apikey', '#cfg-skip-review', '#cfg-review-strict', '#cfg-support-always-new', '#cfg-report-numbers', '#rc-url', '#rc-username', '#rc-password', '#cfg-rc-enabled', '#cfg-log-file', '#cfg-log-path'];
+  const autoSaveInputs = ['#cfg-url', '#cfg-apikey', '#cfg-skip-review', '#cfg-review-strict', '#cfg-support-always-new', '#cfg-report-numbers', '#cfg-report-cache-ttl', '#rc-url', '#rc-username', '#rc-password', '#cfg-rc-enabled', '#cfg-log-file', '#cfg-log-path'];
   autoSaveInputs.forEach(sel => {
     const el = $(sel);
     if (!el) return;
@@ -1017,6 +1032,7 @@ function getConfigPayload() {
     review_strict: $('#cfg-review-strict').checked,
     support_always_new: $('#cfg-support-always-new').checked,
     report_with_numbers: $('#cfg-report-numbers').checked,
+    report_cache_ttl: parseInt($('#cfg-report-cache-ttl').value || '60', 10),
     rc_url: $('#rc-url').value.trim(),
     rc_username: $('#rc-username').value.trim(),
     rc_password: $('#rc-password').value,
@@ -1038,6 +1054,7 @@ async function resetConfig() {
     $('#cfg-review-strict').checked = true;
     $('#cfg-support-always-new').checked = false;
     $('#cfg-report-numbers').checked = true;
+    $('#cfg-report-cache-ttl').value = 60;
     $('#rc-url').value = 'http://192.168.0.83:3009';
     $('#rc-username').value = '';
     $('#rc-password').value = '';
@@ -1376,6 +1393,7 @@ async function doGenerate(showTiming) {
   const reviewStrict = $('#cfg-review-strict').checked;
   const supportAlwaysNew = $('#cfg-support-always-new').checked;
   const reportWithNumbers = $('#cfg-report-numbers').checked;
+  const reportCacheTtl = parseInt($('#cfg-report-cache-ttl').value || '60', 10);
   const projectIds = getSelectedIds();
 
   if (!url) { toast('请输入服务器地址', 'warning'); switchTab('settings'); return; }
@@ -1399,6 +1417,7 @@ async function doGenerate(showTiming) {
       custom_other: customOther, skip_review: skipReview,
       review_strict: reviewStrict, support_always_new: supportAlwaysNew,
       report_with_numbers: reportWithNumbers,
+      report_cache_ttl: reportCacheTtl,
     });
 
     if (!r.ok) {

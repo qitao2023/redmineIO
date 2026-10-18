@@ -98,6 +98,7 @@ class Config:
             "review_strict": True,  # True=审核复核仅计入状态/指派变更，纯评论不算
             "support_always_new": False,  # True=支持类Issue始终显示初始状态（新建）
             "report_with_numbers": True,  # True=节号带数量 + issue带序号
+            "report_cache_ttl": 60,  # 历史日报数据缓存秒数，0=关闭
             # RocketChat 发送设置
             "rc_url": "",  # RocketChat 服务器地址
             "rc_username": "",  # 登录用户名
@@ -149,10 +150,13 @@ class Config:
                 self.data["support_always_new"] = rp["support_always_new"]
             if "report_with_numbers" in rp:
                 self.data["report_with_numbers"] = rp["report_with_numbers"]
+            if "report_cache_ttl" in rp:
+                self.data["report_cache_ttl"] = rp["report_cache_ttl"]
 
         # 也支持顶层平铺字段
         for key in ("redmine_url", "api_key", "timezone", "output_dir", "project_ids",
-                     "skip_review", "review_strict", "support_always_new", "report_with_numbers"):
+                     "skip_review", "review_strict", "support_always_new", "report_with_numbers",
+                     "report_cache_ttl"):
             if key in raw and raw[key]:
                 self.data[key] = raw[key]
 
@@ -253,6 +257,14 @@ class Config:
     def report_with_numbers(self) -> bool:
         """日报是否在节号后显示数量，issue 前带序号。"""
         return bool(self.data.get("report_with_numbers", False))
+
+    @property
+    def report_cache_ttl(self) -> int:
+        """历史日报数据缓存秒数，0=关闭，默认60。"""
+        try:
+            return max(0, min(3600, int(self.data.get("report_cache_ttl", 60))))
+        except (TypeError, ValueError):
+            return 60
 
     @property
     def rc_url(self) -> str:

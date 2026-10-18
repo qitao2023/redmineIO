@@ -49,7 +49,6 @@ _DETAIL_CACHE_LOCK = threading.Lock()
 # 历史日报整份数据缓存：同一日期/项目/配置在短时间内重复生成时，
 # 直接复用上一次的筛选 + journal 结果，不再重新请求 Redmine。
 _REPORT_CACHE_MAX = 8
-_REPORT_CACHE_TTL = 2 * 60
 _REPORT_CACHE: "OrderedDict[tuple, tuple[float, Any]]" = OrderedDict()
 _REPORT_CACHE_LOCK = threading.Lock()
 
@@ -123,14 +122,16 @@ def _detail_cache_put(key: tuple, value: Any) -> None:
             _DETAIL_CACHE.popitem(last=False)
 
 
-def _report_cache_get(key: tuple) -> Any:
+def _report_cache_get(key: tuple, ttl: int) -> Any:
+    if ttl <= 0:
+        return None
     now = time.time()
     with _REPORT_CACHE_LOCK:
         item = _REPORT_CACHE.get(key)
         if item is None:
             return None
         created, value = item
-        if now - created > _REPORT_CACHE_TTL:
+        if now - created > ttl:
             _REPORT_CACHE.pop(key, None)
             return None
         _REPORT_CACHE.move_to_end(key)
@@ -234,10 +235,15 @@ class RedmineClientError(Exception):
 class RedmineClient:
     """封装 Redmine REST API 调用。"""
 
-    def __init__(self, url: str, api_key: str, timeout: int = 15):
+    def __init__(self, url: str, api_key: str, timeout: int = 15,
+                 report_cache_ttl: int = 60):
         self.url = url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
+        try:
+            self._report_cache_ttl = max(0, min(3600, int(report_cache_ttl)))
+        except (TypeError, ValueError):
+            self._report_cache_ttl = 60
         # python-redmine 的 ResourceManager 把 url/params 存在实例属性上，
         # 多线程共享同一个 Redmine 对象会互相覆盖请求参数。这里每个线程
         # 使用独立的 Redmine 实例（各自持有连接池），请求互不干扰。
@@ -1589,17 +1595,21 @@ class RedmineClient:
             project_ids, skip_review, review_strict,
             support_always_new, debug_journals, extra_issue_ids,
         )
-        if report_date < today_str:
-            cached = _report_cache_get(cache_key)
+        if report_date < today_str and self._report_cache_ttl > 0:
+            cached = _report_cache_get(
+                cache_key, self._report_cache_ttl
+            )
             if cached is not None:
                 _p("命中历史日报缓存，直接复用...", 95)
                 print(
-                    "  [缓存] 复用历史日报数据（2分钟内）",
+                    f"  [缓存] 复用历史日报数据"
+                    f"（{self._report_cache_ttl}秒内）",
                     file=sys.stderr,
                 )
                 cached = copy.copy(cached)
                 cached.timing = dict(cached.timing)
                 cached.timing["report_cache_hit"] = True
+                cached.timing["report_cache_ttl"] = self._report_cache_ttl
                 cached.timing["build_total"] = 0.01
                 return cached
 
@@ -1707,6 +1717,6 @@ class RedmineClient:
             timing=timing,
             warnings=warnings,
         )
-        if report_date < today_str:
+        if report_date < today_str and self._report_cache_ttl > 0:
             _report_cache_put(cache_key, report)
         return report

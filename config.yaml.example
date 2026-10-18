@@ -30,6 +30,10 @@ requests_timeout: 30
 # 跳过审核/复核（只查本人创建/经办的 Issue，大幅提速）
 skip_review: false
 
+# 历史日报数据缓存秒数：同一日期/项目/配置在此时长内重复生成时
+# 直接复用上一次结果，不再请求 Redmine；0=关闭；默认 60 秒
+report_cache_ttl: 60
+
 # RocketChat 发送设置（在 GUI 设置页中配置，可留空）
 # rocketchat:
 #   url: "http://192.168.0.83:3009"
