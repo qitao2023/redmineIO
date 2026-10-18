@@ -509,6 +509,13 @@ class RedmineClient:
         multi_project_value = "|".join(
             str(pid) for pid in sorted(project_id_set)
         )
+        # 标准 Redmine 列表过滤器写法。相比 project_id=1|2|3 的快捷写法，
+        # 这个格式来自 Web UI 查询参数，旧版/定制版 Redmine 兼容性更好。
+        multi_project_params = {
+            "f[]": ["project_id"],
+            "op[project_id]": "=",
+            "v[project_id][]": [str(pid) for pid in sorted(project_id_set)],
+        }
 
         page_size = max(1, min(int(limit or _PAGE_SIZE), _PAGE_SIZE))
         primary_filter, followup_filter = _report_query_filters(report_date)
@@ -586,7 +593,7 @@ class RedmineClient:
                         sort="updated_on:desc",
                         limit=page_size,
                         offset=offset,
-                        project_id=multi_project_value,
+                        **multi_project_params,
                     )
                     page = list(result_set)
                     try:
@@ -661,12 +668,12 @@ class RedmineClient:
                             futures.append(executor.submit(
                                 _query_date, updated_filter, True,
                                 author_id=user_id,
-                                project_id=multi_project_value,
+                                **multi_project_params,
                             ))
                             futures.append(executor.submit(
                                 _query_date, updated_filter, True,
                                 assigned_to_id=user_id,
-                                project_id=multi_project_value,
+                                **multi_project_params,
                             ))
                         else:
                             for pid in sorted(project_id_set):
@@ -685,24 +692,27 @@ class RedmineClient:
                             )
                         else:
                             supported, overflow = False, False
-                        if supported and overflow:
-                            # 全量结果超过 300 条：按项目拆开，并保留
-                            # author/assigned 安全网。
+                        if supported:
+                            # author/assigned 始终保留为安全网：即使多项目
+                            # 全量查询少返回了某个项目，本人条目也不会丢。
                             futures.append(executor.submit(
                                 _query_date, updated_filter, True,
                                 author_id=user_id,
-                                project_id=multi_project_value,
+                                **multi_project_params,
                             ))
                             futures.append(executor.submit(
                                 _query_date, updated_filter, True,
                                 assigned_to_id=user_id,
-                                project_id=multi_project_value,
+                                **multi_project_params,
                             ))
-                            for pid in sorted(project_id_set):
-                                futures.append(executor.submit(
-                                    _query_date, updated_filter, False,
-                                    project_id=pid,
-                                ))
+                            if overflow:
+                                # 全量结果超过 300 条：按项目拆开，保证每个
+                                # 项目都有独立的 300 条上限。
+                                for pid in sorted(project_id_set):
+                                    futures.append(executor.submit(
+                                        _query_date, updated_filter, False,
+                                        project_id=pid,
+                                    ))
                         elif not supported:
                             # 多项目过滤不可用：完全回退按项目查询。
                             for pid in sorted(project_id_set):
@@ -719,8 +729,6 @@ class RedmineClient:
                                     _query_date, updated_filter, False,
                                     project_id=pid,
                                 ))
-                        # supported=True 且未超限：多项目全量查询已经完整
-                        # 覆盖了 author/assigned 的 Issue，无需再查。
                 else:
                     # 未配置项目：全站查询
                     futures.append(executor.submit(
@@ -1007,14 +1015,28 @@ class RedmineClient:
         supported = False
         try:
             result_set = self._api().issue.filter(
-                project_id=multi_value,
                 status_id="*",
-                limit=1,
+                limit=100,
+                sort="id:asc",
+                **{
+                    "f[]": ["project_id"],
+                    "op[project_id]": "=",
+                    "v[project_id][]": [
+                        str(pid) for pid in sorted(project_ids)
+                    ],
+                },
             )
             page = list(result_set)
             if page:
-                pid = _related_id(page[0], "project")
-                supported = pid in project_ids
+                found_projects = {
+                    _related_id(issue, "project") for issue in page
+                }
+                found_projects.discard(0)
+                supported = found_projects.issubset(project_ids)
+                # 多项目过滤如果只返回了第一个项目，说明服务端没有真正
+                # 按多值过滤。此时宁可回退按项目查，也不能漏项目。
+                if len(project_ids) > 1 and len(found_projects) == 1:
+                    supported = False
         except Exception as e:
             logger.warning(
                 "多项目过滤探测失败，回退按项目查询: %s", str(e)[:100]
