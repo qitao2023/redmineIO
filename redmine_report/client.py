@@ -631,6 +631,25 @@ class RedmineClient:
                         max_results=max_results,
                     ))
 
+                if is_followup:
+                    # 单日“最早 100 条”可能漏掉当天下午/晚上才更新的
+                    # 记录（109300 就是 10-16 16:59 更新的）。再补一组
+                    # “最晚 100 条”，覆盖每天的头尾两段。
+                    if project_ids:
+                        for pid in project_ids:
+                            futures.append(executor.submit(
+                                _query_date, updated_filter, False,
+                                sort_order="updated_on:desc",
+                                max_results=100,
+                                project_id=pid,
+                            ))
+                    else:
+                        futures.append(executor.submit(
+                            _query_date, updated_filter,
+                            sort_order="updated_on:desc",
+                            max_results=100,
+                        ))
+
             for future in as_completed(futures):
                 try:
                     future.result()
