@@ -31,7 +31,7 @@ _BEIJING_TZ = _tz(timedelta(hours=8))
 # 并发参数
 _FILTER_WORKERS = 16         # 阶段1: filter 查询并发数
 _NEW_ISSUE_WORKERS = 20      # 阶段2: 新增 Issue 详情抓取并发数
-_JOURNAL_WORKERS = 32        # 阶段3: journal 抓取并发数
+_JOURNAL_WORKERS = 48        # 阶段3: journal 抓取并发数
 
 # 分页参数。Redmine 单页上限是 100，请求 limit=300 时 python-redmine
 # 会固定发 3 次请求（300/200/100），即使结果只有几条。这里自己翻页，
@@ -1280,7 +1280,12 @@ class RedmineClient:
         review_strict=True 时：仅计入状态或指派变更，纯评论忽略。
         """
         if not issues:
-            return [], 0
+            return [], {
+                "checked": 0, "fetched": 0, "failed": 0,
+                "no_user": 0, "review_filtered": 0,
+                "exceptions": 0, "confirmed": 0,
+                "no_user_debug": [], "errors_debug": [],
+            }
 
         t0 = time.perf_counter()
         total_fetched = 0
@@ -1595,14 +1600,16 @@ class RedmineClient:
             project_ids, skip_review, review_strict,
             support_always_new, debug_journals, extra_issue_ids,
         )
-        if report_date < today_str and self._report_cache_ttl > 0:
+        # 普通生成可用缓存；“耗时分析”始终重新查询，保证诊断看到最新数据。
+        cache_enabled = self._report_cache_ttl > 0 and not debug_journals
+        if report_date <= today_str and cache_enabled:
             cached = _report_cache_get(
                 cache_key, self._report_cache_ttl
             )
             if cached is not None:
                 _p("命中历史日报缓存，直接复用...", 95)
                 print(
-                    f"  [缓存] 复用历史日报数据"
+                    f"  [缓存] 复用日报数据"
                     f"（{self._report_cache_ttl}秒内）",
                     file=sys.stderr,
                 )
@@ -1717,6 +1724,6 @@ class RedmineClient:
             timing=timing,
             warnings=warnings,
         )
-        if report_date < today_str and self._report_cache_ttl > 0:
+        if report_date <= today_str and cache_enabled:
             _report_cache_put(cache_key, report)
         return report

@@ -98,7 +98,7 @@ class Config:
             "review_strict": True,  # True=审核复核仅计入状态/指派变更，纯评论不算
             "support_always_new": False,  # True=支持类Issue始终显示初始状态（新建）
             "report_with_numbers": True,  # True=节号带数量 + issue带序号
-            "report_cache_ttl": 60,  # 历史日报数据缓存秒数，0=关闭
+            "report_cache_ttl": 60,  # 日报数据缓存秒数，0=关闭
             # RocketChat 发送设置
             "rc_url": "",  # RocketChat 服务器地址
             "rc_username": "",  # 登录用户名
@@ -260,7 +260,7 @@ class Config:
 
     @property
     def report_cache_ttl(self) -> int:
-        """历史日报数据缓存秒数，0=关闭，默认60。"""
+        """日报数据缓存秒数，0=关闭，默认60。"""
         try:
             return max(0, min(3600, int(self.data.get("report_cache_ttl", 60))))
         except (TypeError, ValueError):

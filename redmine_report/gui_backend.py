@@ -437,7 +437,7 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         lines.append("──────── 耗时统计 ────────")
         if timing.get("report_cache_hit"):
             lines.append(
-                f"数据来源:      历史日报缓存"
+                f"数据来源:      日报缓存"
                 f"（{timing.get('report_cache_ttl', '?')}秒内复用，"
                 f"未重新请求 Redmine）"
             )
