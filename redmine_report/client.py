@@ -508,6 +508,23 @@ class RedmineClient:
             query_filters.append(followup_filter)
         historical = followup_filter is not None
 
+        # “曾经指派给本人”的日期列表。某些 Issue 本人在报告日处理过
+        # （例如把指派从自己转给别人），之后 updated_on 跑到后面去了；
+        # 普通的 assigned_to_id 当前指派查询找不到它。按天用 ever 过滤
+        # 查一遍，专门补这类临时经办/转派记录。
+        ev_dates = [report_date]
+        if historical:
+            try:
+                today_dt = datetime.now(_BEIJING_TZ).date()
+                ev_dt = datetime.strptime(
+                    report_date, "%Y-%m-%d"
+                ).date() + timedelta(days=1)
+                while ev_dt <= today_dt and len(ev_dates) < 32:
+                    ev_dates.append(ev_dt.isoformat())
+                    ev_dt += timedelta(days=1)
+            except (TypeError, ValueError):
+                ev_dates = [report_date]
+
         def _query_date(updated_on_filter: str,
                         apply_project_filter: bool = False,
                         **extra_filters):
@@ -605,6 +622,19 @@ class RedmineClient:
                         assigned_to_id=user_id,
                     ))
                     futures.append(executor.submit(_query_date, updated_filter))
+
+            # 临时经办/转派历史：assigned_to_id 的 ev（曾经指派）过滤。
+            # 110203 就是报告日 20:35 由本人从 7 转给 14、10-16 又被
+            # 别人更新，普通 updated_on/当前指派查询都会漏掉。
+            for ev_date in ev_dates:
+                futures.append(executor.submit(
+                    _query_date, ev_date, bool(project_id_set),
+                    **{
+                        "f[]": ["assigned_to_id"],
+                        "op[assigned_to_id]": "ev",
+                        "v[assigned_to_id][]": [str(user_id)],
+                    },
+                ))
             for future in as_completed(futures):
                 try:
                     future.result()

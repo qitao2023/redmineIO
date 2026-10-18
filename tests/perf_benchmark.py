@@ -422,6 +422,15 @@ class MockRedmine:
                     return
 
                 if path == "/issues.json":
+                    qs = parse_qs(urlparse(self.path).query)
+                    ev_user = None
+                    if (
+                        "assigned_to_id" in qs.get("f[]", [])
+                        and qs.get("op[assigned_to_id]", [""])[-1] == "ev"
+                    ):
+                        ev_values = qs.get("v[assigned_to_id][]", [])
+                        if ev_values:
+                            ev_user = int(ev_values[-1])
                     selected = []
                     for issue in mock.issues:
                         updated_filter = params.get("updated_on")
@@ -446,6 +455,25 @@ class MockRedmine:
                             assigned != int(params["assigned_to_id"])
                         ):
                             continue
+                        if ev_user is not None:
+                            ever_assigned = assigned == ev_user
+                            if not ever_assigned:
+                                for journal in mock.journals.get(
+                                    issue["id"], []
+                                ):
+                                    for detail in journal.get("details", []):
+                                        if (
+                                            detail.get("name")
+                                            == "assigned_to_id"
+                                            and str(detail.get("new_value"))
+                                            == str(ev_user)
+                                        ):
+                                            ever_assigned = True
+                                            break
+                                    if ever_assigned:
+                                        break
+                            if not ever_assigned:
+                                continue
                         selected.append(issue)
 
                     limit = min(int(params.get("limit", 25)), 100)
