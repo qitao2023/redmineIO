@@ -587,13 +587,17 @@ def _handle_generate(body: dict):
     report_date = body.get("date", "").strip()
     end_time = body.get("time", "").strip()
     project_ids = body.get("project_ids", []) or []
-    extra_issue_ids = _parse_issue_ids(body.get("extra_issues", ""))
     custom_other = body.get("custom_other", "").strip()
     skip_review = body.get("skip_review", False)
     review_strict = body.get("review_strict", True)
     support_always_new = body.get("support_always_new", False)
     report_with_numbers = body.get("report_with_numbers", False)
     show_timing = body.get("show_timing", False)
+    # 诊断补录只属于「耗时分析」，正常生成日报时强制忽略。
+    extra_issue_ids = (
+        _parse_issue_ids(body.get("extra_issues", ""))
+        if show_timing else []
+    )
 
     if not url or not api_key:
         return _err("请先输入服务器地址和 API Key")
