@@ -522,6 +522,7 @@ class RedmineClient:
                     current_limit = min(page_size, max_results - offset)
                     result_set = self._api().issue.filter(
                         updated_on=updated_on_filter,
+                        created_on=f"<={report_date}",
                         status_id="*",
                         sort=sort_order,
                         limit=current_limit,
@@ -532,6 +533,13 @@ class RedmineClient:
                     if not page:
                         break
                     for issue in page:
+                        created = self._to_beijing_date(
+                            getattr(issue, "created_on", None)
+                        )
+                        if created and created > report_date:
+                            # 报告日之后才创建的 Issue，不可能有报告日的
+                            # 本人 journal，直接排除，避免白拉 journal。
+                            continue
                         if apply_project_filter and project_id_set:
                             pid = _related_id(issue, "project")
                             if pid and pid not in project_id_set:
@@ -920,6 +928,9 @@ class RedmineClient:
             updated_matches = any(
                 _matches_updated(updated, f) for f in query_filters
             )
+            created_after_report = bool(
+                created and created > report_date
+            )
             report_day_objs = []
             other_objs = []
             for journal in journals:
@@ -958,6 +969,8 @@ class RedmineClient:
             elif not in_candidates:
                 if not project_selected:
                     reason = "所属项目未勾选"
+                elif created_after_report:
+                    reason = f"创建日期 {created} 晚于报告日（自动排除）"
                 elif not updated_matches:
                     reason = f"最后更新日 {updated} 不在查询范围"
                 else:
