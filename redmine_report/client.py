@@ -140,26 +140,38 @@ def _related_id(resource: Any, attr: str) -> int:
         return 0
 
 
-def _updated_on_filter(report_date: str, today: str | None = None) -> str:
-    """构造 Redmine 的 updated_on 查询条件。
+def _report_query_filters(report_date: str,
+                          today: str | None = None) -> tuple[str, str | None]:
+    """返回 (报告日查询条件, 后续更新查询条件)。
 
-    当天日报用单日条件；历史日报必须从报告日一直查到今天，因为：
     Redmine 的 updated_on 是“最后一次更新时间”。某个 Issue 在报告日
-    被本人操作过、之后又被别人更新，它的 updated_on 已经跑到后面去了，
-    单日查询会直接漏掉它（后面的 journal 校验再准也没机会看到）。
+    被本人操作过、之后又被更新，它的 updated_on 会跑到后面去，单日查询
+    会漏掉它。
 
-    返回单日 ``YYYY-MM-DD`` 或 Redmine 的区间写法
-    ``><YYYY-MM-DD|YYYY-MM-DD``，由 journal 校验再按报告日过滤。
+    但把整个区间合成一次查询也有问题：结果按 updated_on 倒序返回，
+    今天更新的 Issue 会把报告日的 Issue 挤出单次查询的 300 条上限，
+    反而比单日查询更少。因此拆成两次独立查询：
+
+    1. 报告日单日查询 —— 与旧版完全一致，保证报告日候选不被挤掉；
+    2. 报告日之后到今天的查询 —— 只做“补漏”，命中后仍由 journal
+       校验按报告日过滤，不会把之后别人的更新误收进日报。
     """
     if today is None:
         today = datetime.now(_BEIJING_TZ).date().isoformat()
     try:
-        datetime.strptime(report_date, "%Y-%m-%d")
+        report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+        today_dt = datetime.strptime(today, "%Y-%m-%d").date()
     except (TypeError, ValueError):
-        return report_date
-    if report_date < today:
-        return f"><{report_date}|{today}"
-    return report_date
+        return report_date, None
+    if report_dt >= today_dt:
+        return report_date, None
+
+    next_day = (report_dt + timedelta(days=1)).isoformat()
+    if next_day == today:
+        followup = today
+    else:
+        followup = f"><{next_day}|{today}"
+    return report_date, followup
 
 
 class RedmineClientError(Exception):
@@ -487,8 +499,11 @@ class RedmineClient:
                     pass
 
         page_size = max(1, min(int(limit or _PAGE_SIZE), _PAGE_SIZE))
-        updated_filter = _updated_on_filter(report_date)
-        historical = updated_filter != report_date
+        primary_filter, followup_filter = _report_query_filters(report_date)
+        query_filters = [primary_filter]
+        if followup_filter:
+            query_filters.append(followup_filter)
+        historical = followup_filter is not None
 
         def _query_date(updated_on_filter: str,
                         apply_project_filter: bool = False,
@@ -545,53 +560,48 @@ class RedmineClient:
         t1 = time.perf_counter()
 
         with ThreadPoolExecutor(max_workers=_FILTER_WORKERS) as executor:
-            if project_ids:
-                if skip_review:
-                    # 只查本人：仍按项目查询，保留 Redmine 对子项目的
-                    # 原有包含行为（N 个项目 = 2N 次请求）。
-                    futures = []
-                    for pid in project_ids:
+            futures = []
+            for updated_filter in query_filters:
+                if project_ids:
+                    if skip_review:
+                        # 只查本人：仍按项目查询，保留 Redmine 对子项目的
+                        # 原有包含行为（N 个项目 = 2N 次请求）。
+                        for pid in project_ids:
+                            futures.append(executor.submit(
+                                _query_date, updated_filter, False,
+                                author_id=user_id, project_id=pid,
+                            ))
+                            futures.append(executor.submit(
+                                _query_date, updated_filter, False,
+                                assigned_to_id=user_id, project_id=pid,
+                            ))
+                    else:
+                        # 本人创建/经办的全站查询作为安全网（2 次请求），
+                        # 每个项目只再查一次“当天所有更新”，不再按
+                        # author/assigned/全部 各查一遍（原来 3N 次，现在 N+2 次）。
                         futures.append(executor.submit(
-                            _query_date, updated_filter, False,
-                            author_id=user_id, project_id=pid,
-                        ))
-                        futures.append(executor.submit(
-                            _query_date, updated_filter, False,
-                            assigned_to_id=user_id, project_id=pid,
-                        ))
-                else:
-                    # 本人创建/经办的全站查询作为安全网（2 次请求），
-                    # 每个项目只再查一次“当天所有更新”，不再按
-                    # author/assigned/全部 各查一遍（原来 3N 次，现在 N+2 次）。
-                    futures = [
-                        executor.submit(
                             _query_date, updated_filter, True,
                             author_id=user_id,
-                        ),
-                        executor.submit(
+                        ))
+                        futures.append(executor.submit(
                             _query_date, updated_filter, True,
                             assigned_to_id=user_id,
-                        ),
-                    ]
-                    for pid in project_ids:
-                        futures.append(
-                            executor.submit(
+                        ))
+                        for pid in project_ids:
+                            futures.append(executor.submit(
                                 _query_date, updated_filter, False,
                                 project_id=pid,
-                            )
-                        )
-            else:
-                # 未配置项目：回退原逻辑（全站查询）
-                futures = [
-                    executor.submit(
+                            ))
+                else:
+                    # 未配置项目：全站查询
+                    futures.append(executor.submit(
                         _query_date, updated_filter, False, author_id=user_id
-                    ),
-                    executor.submit(
+                    ))
+                    futures.append(executor.submit(
                         _query_date, updated_filter, False,
                         assigned_to_id=user_id,
-                    ),
-                    executor.submit(_query_date, updated_filter),
-                ]
+                    ))
+                    futures.append(executor.submit(_query_date, updated_filter))
             for future in as_completed(futures):
                 try:
                     future.result()
@@ -602,7 +612,8 @@ class RedmineClient:
         filter_elapsed = t2 - t1
         query_count = len(futures)
         print(
-            f"  [计时] 阶段1-filter查询(updated_on={updated_filter}): "
+            f"  [计时] 阶段1-filter查询"
+            f"(updated_on={' + '.join(query_filters)}): "
             f"{filter_elapsed:.2f}s，"
             f"共 {query_count} 次查询，候选 {len(candidates)} 个 Issue",
             file=sys.stderr,
@@ -786,7 +797,7 @@ class RedmineClient:
         t_total = time.perf_counter() - t_total_start
         timing = {
             "filter": filter_elapsed,
-            "updated_filter": updated_filter,
+            "updated_filter": " + ".join(query_filters),
             "historical": historical,
             "filter_queries": query_count,
             "filter_candidates": len(candidates),
