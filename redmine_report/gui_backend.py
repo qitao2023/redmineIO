@@ -429,6 +429,10 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         lines = []
         lines.append("")
         lines.append("──────── 耗时统计 ────────")
+        if timing.get("report_cache_hit"):
+            lines.append(
+                "数据来源:      历史日报缓存（2分钟内复用，未重新请求 Redmine）"
+            )
         lines.append(f"认证:          {timing.get('auth', '?')}s")
         lines.append(
             f"filter查询:    {timing.get('filter', '?')}s  "

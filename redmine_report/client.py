@@ -1,6 +1,7 @@
 """Redmine API 封装 — 所有 API 调用的唯一入口。"""
 
 import logging
+import copy
 import sys
 import threading
 import time
@@ -28,7 +29,7 @@ _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周�
 _BEIJING_TZ = _tz(timedelta(hours=8))
 
 # 并发参数
-_FILTER_WORKERS = 12         # 阶段1: filter 查询并发数
+_FILTER_WORKERS = 16         # 阶段1: filter 查询并发数
 _NEW_ISSUE_WORKERS = 20      # 阶段2: 新增 Issue 详情抓取并发数
 _JOURNAL_WORKERS = 32        # 阶段3: journal 抓取并发数
 
@@ -44,6 +45,13 @@ _DETAIL_CACHE_MAX = 400
 _DETAIL_CACHE_TTL = 30 * 60
 _DETAIL_CACHE: "OrderedDict[tuple, tuple[float, Any]]" = OrderedDict()
 _DETAIL_CACHE_LOCK = threading.Lock()
+
+# 历史日报整份数据缓存：同一日期/项目/配置在短时间内重复生成时，
+# 直接复用上一次的筛选 + journal 结果，不再重新请求 Redmine。
+_REPORT_CACHE_MAX = 8
+_REPORT_CACHE_TTL = 2 * 60
+_REPORT_CACHE: "OrderedDict[tuple, tuple[float, Any]]" = OrderedDict()
+_REPORT_CACHE_LOCK = threading.Lock()
 
 # 认证结果短期缓存（同一 Key 在多次生成之间复用）
 _AUTH_CACHE_TTL = 10 * 60
@@ -113,6 +121,53 @@ def _detail_cache_put(key: tuple, value: Any) -> None:
         _DETAIL_CACHE.move_to_end(key)
         while len(_DETAIL_CACHE) > _DETAIL_CACHE_MAX:
             _DETAIL_CACHE.popitem(last=False)
+
+
+def _report_cache_get(key: tuple) -> Any:
+    now = time.time()
+    with _REPORT_CACHE_LOCK:
+        item = _REPORT_CACHE.get(key)
+        if item is None:
+            return None
+        created, value = item
+        if now - created > _REPORT_CACHE_TTL:
+            _REPORT_CACHE.pop(key, None)
+            return None
+        _REPORT_CACHE.move_to_end(key)
+        return value
+
+
+def _report_cache_put(key: tuple, value: Any) -> None:
+    with _REPORT_CACHE_LOCK:
+        _REPORT_CACHE[key] = (time.time(), value)
+        _REPORT_CACHE.move_to_end(key)
+        while len(_REPORT_CACHE) > _REPORT_CACHE_MAX:
+            _REPORT_CACHE.popitem(last=False)
+
+
+def _report_cache_key(url: str, api_key: str, report_date: str,
+                      project_ids, skip_review: bool,
+                      review_strict: bool, support_always_new: bool,
+                      debug_journals: bool, extra_issue_ids) -> tuple:
+    pids: list[int] = []
+    for pid in project_ids or []:
+        try:
+            pids.append(int(pid))
+        except (TypeError, ValueError):
+            pass
+    extras: list[int] = []
+    for issue_id in extra_issue_ids or []:
+        try:
+            extras.append(int(issue_id))
+        except (TypeError, ValueError):
+            pass
+    return (
+        url, api_key, report_date,
+        tuple(sorted(set(pids))),
+        bool(skip_review), bool(review_strict),
+        bool(support_always_new), bool(debug_journals),
+        tuple(sorted(set(extras))),
+    )
 
 
 def _related_id(resource: Any, attr: str) -> int:
@@ -1522,11 +1577,31 @@ class RedmineClient:
         """
         t_build_start = time.perf_counter()
         if report_date is None:
-            report_date = date.today().isoformat()
+            report_date = datetime.now(_BEIJING_TZ).date().isoformat()
 
         def _p(msg, pct):
             if progress_callback:
                 progress_callback(msg, pct)
+
+        today_str = datetime.now(_BEIJING_TZ).date().isoformat()
+        cache_key = _report_cache_key(
+            self.url, self._api_key, report_date,
+            project_ids, skip_review, review_strict,
+            support_always_new, debug_journals, extra_issue_ids,
+        )
+        if report_date < today_str:
+            cached = _report_cache_get(cache_key)
+            if cached is not None:
+                _p("命中历史日报缓存，直接复用...", 95)
+                print(
+                    "  [缓存] 复用历史日报数据（2分钟内）",
+                    file=sys.stderr,
+                )
+                cached = copy.copy(cached)
+                cached.timing = dict(cached.timing)
+                cached.timing["report_cache_hit"] = True
+                cached.timing["build_total"] = 0.01
+                return cached
 
         _p("正在认证...", 5)
         t_auth_start = time.perf_counter()
@@ -1620,7 +1695,7 @@ class RedmineClient:
                 f"有 {ff['manual']} 个手动补充 Issue 抓取失败，请检查编号或权限"
             )
 
-        return DailyReport(
+        report = DailyReport(
             user_name=user_info["name"],
             date=report_date,
             weekday_cn=weekday_cn,
@@ -1632,3 +1707,6 @@ class RedmineClient:
             timing=timing,
             warnings=warnings,
         )
+        if report_date < today_str:
+            _report_cache_put(cache_key, report)
+        return report

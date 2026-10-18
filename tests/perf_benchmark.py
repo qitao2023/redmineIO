@@ -686,6 +686,11 @@ def historical_check(package_root: str) -> dict:
         # 这三条在报告日都被本人操作过；模拟它们当天之后又被更新。
         for iid in (105, 107, 111):
             mock.by_id[iid]["updated_on"] = f"{next_day}T02:00:00Z"
+        # 让历史回归测试绕过“2分钟内复用整份日报”的缓存，
+        # 确保它验证的是重新查询 + journal 校验。
+        from redmine_report import client as client_module
+        with client_module._REPORT_CACHE_LOCK:
+            client_module._REPORT_CACHE.clear()
         after = entry_ids()
         return {
             "report_date": REPORT_DATE,
