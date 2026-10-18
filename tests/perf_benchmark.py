@@ -298,10 +298,11 @@ def build_fixture() -> tuple[list[dict], dict[int, list[dict]]]:
 class MockRedmine:
     def __init__(self, delay: float = 0.04, search_delay: float = 0.0,
                  search_ids: list[int] | None = None, spam: int = 0,
-                 own_spam: int = 0):
+                 own_spam: int = 0, legacy_project_filter: bool = False):
         self.delay = delay
         self.search_delay = search_delay
         self.search_ids = search_ids or []
+        self.legacy_project_filter = legacy_project_filter
         self.issues, self.journals = build_fixture()
         for i in range(spam):
             iid = 2000 + i
@@ -433,10 +434,16 @@ class MockRedmine:
                                     continue
                             elif not issue["updated_on"].startswith(updated_filter):
                                 continue
-                        if params.get("project_id") and (
-                            issue["project"]["id"] != int(params["project_id"])
-                        ):
-                            continue
+                        project_filter = params.get("project_id")
+                        if project_filter:
+                            if mock.legacy_project_filter and "|" in project_filter:
+                                continue
+                            project_ids = {
+                                int(pid) for pid in project_filter.split("|")
+                                if pid.strip()
+                            }
+                            if issue["project"]["id"] not in project_ids:
+                                continue
                         if params.get("author_id") and (
                             issue["author"]["id"] != int(params["author_id"])
                         ):
@@ -542,7 +549,8 @@ def run(package_root: str, runs: int = 2,
         search_delay: float = 0.0,
         search_ids: list[int] | None = None,
         spam: int = 0,
-        own_spam: int = 0) -> dict:
+        own_spam: int = 0,
+        legacy_project_filter: bool = False) -> dict:
     sys.path.insert(0, str(Path(package_root).resolve()))
     from redmine_report.client import RedmineClient
     from redmine_report.generator import generate_report
@@ -550,6 +558,7 @@ def run(package_root: str, runs: int = 2,
     mock = MockRedmine(
         delay=delay, search_delay=search_delay, search_ids=search_ids,
         spam=spam, own_spam=own_spam,
+        legacy_project_filter=legacy_project_filter,
     ).start()
     try:
         client = RedmineClient(url=mock.url, api_key="test-key")
@@ -593,6 +602,7 @@ def run(package_root: str, runs: int = 2,
                 "search_ids": search_ids,
                 "spam": spam,
                 "own_spam": own_spam,
+                "legacy_project_filter": legacy_project_filter,
             },
             "timings": timings,
             "runs": reports,
@@ -690,6 +700,8 @@ def main() -> int:
                         help="add N unrelated review candidates")
     parser.add_argument("--own-spam", type=int, default=0,
                         help="add N issues owned by alice with today's journal")
+    parser.add_argument("--legacy-project-filter", action="store_true",
+                        help="simulate a server that does not support project_id=1|2|3")
     args = parser.parse_args()
 
     project_ids = None if args.projects.lower() == "none" else [
@@ -709,6 +721,7 @@ def main() -> int:
         search_ids=search_ids,
         spam=args.spam,
         own_spam=args.own_spam,
+        legacy_project_filter=args.legacy_project_filter,
     )
     if args.timeout_check:
         result["timeout"] = timeout_check(args.package_root)
