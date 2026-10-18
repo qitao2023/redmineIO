@@ -762,6 +762,30 @@ class RedmineClient:
         manual_failures = 0
         manual_added = 0
         result_ids = {entry["issue_id"] for entry in result}
+        result_ids_before_manual = set(result_ids)
+        candidate_ids = {issue.id for issue in candidates}
+        need_journal_ids = {issue.id for issue in need_journal_check}
+
+        def _journal_detail_names(journal) -> list[str]:
+            names = []
+            for d in getattr(journal, "details", []):
+                try:
+                    dd = dict(d) if hasattr(d, "__iter__") else {}
+                    name = str(
+                        dd.get("name", "") if dd else getattr(d, "name", "")
+                    )
+                except Exception:
+                    name = ""
+                if name:
+                    names.append(name)
+            return names
+
+        def _matches_updated(date_str: str, filter_str: str) -> bool:
+            if filter_str.startswith("><") and "|" in filter_str:
+                start, end = filter_str[2:].split("|", 1)
+                return start <= date_str <= end
+            return date_str == filter_str
+
         for raw_id in (extra_issue_ids or []):
             try:
                 issue_id = int(raw_id)
@@ -779,17 +803,116 @@ class RedmineClient:
                 )
                 continue
 
+            # ── 诊断：这条 Issue 为什么没被自动收录 ──
+            journals = list(getattr(detailed, "journals", []))
+            project_id = _related_id(detailed, "project")
+            project_name = getattr(
+                getattr(detailed, "project", None), "name", ""
+            )
+            author_id = _related_id(detailed, "author")
+            author_name = getattr(
+                getattr(detailed, "author", None), "name", ""
+            )
+            tracker = getattr(detailed, "tracker", None)
+            tracker_name = getattr(tracker, "name", "") if tracker else ""
+            created = self._to_beijing_date(
+                getattr(detailed, "created_on", None)
+            )
+            updated = self._to_beijing_date(
+                getattr(detailed, "updated_on", None)
+            )
+            in_candidates = issue_id in candidate_ids
+            in_need = issue_id in need_journal_ids
+            in_result_before = issue_id in result_ids_before_manual
+            project_selected = (
+                not project_id_set or project_id in project_id_set
+            )
+            updated_matches = any(
+                _matches_updated(updated, f) for f in query_filters
+            )
+
+            user_journals: list[tuple[str, str, list[str]]] = []
+            report_day_user_journals: list[tuple[str, str, list[str]]] = []
+            for journal in journals:
+                if _related_id(journal, "user") != int(user_id):
+                    continue
+                jdate = self._to_beijing_date(
+                    getattr(journal, "created_on", None)
+                )
+                jtime = self._extract_time(
+                    getattr(journal, "created_on", None)
+                )
+                names = _journal_detail_names(journal)
+                user_journals.append((jdate, jtime, names))
+                if jdate == report_date:
+                    report_day_user_journals.append((jdate, jtime, names))
+
+            if in_result_before:
+                reason = "已在自动结果中"
+            elif not in_candidates:
+                if not project_selected:
+                    reason = "所属项目未勾选"
+                elif not updated_matches:
+                    reason = f"最后更新日 {updated} 不在查询范围"
+                else:
+                    reason = (
+                        "查询范围内但 filter 未返回"
+                        "（检查权限/300条上限/子项目）"
+                    )
+            elif not in_need:
+                reason = "自动候选但未进入 journal 待验证（可能是报告日新建）"
+            else:
+                has_change = any(
+                    "status_id" in names
+                    or any("assigned_to" in n for n in names)
+                    for _, _, names in report_day_user_journals
+                )
+                if not report_day_user_journals:
+                    reason = "本人报告日无 journal"
+                elif (review_strict and author_id != int(user_id)
+                      and not has_change):
+                    reason = "review_strict 过滤（本人仅评论，未改状态/指派）"
+                else:
+                    reason = "journal 校验未确认（检查抓取/解析）"
+
+            manual_details.append(
+                f"#{issue_id} [{tracker_name or '?'}] "
+                f"项目={project_name}(#{project_id}) "
+                f"作者={author_name}(#{author_id}) "
+                f"创建={created} 更新={updated}"
+            )
+            manual_details.append(
+                f"  自动判定: 候选={'是' if in_candidates else '否'} "
+                f"待验证={'是' if in_need else '否'} "
+                f"自动确认={'是' if in_result_before else '否'} → {reason}"
+            )
+            if report_day_user_journals:
+                _, latest_time, latest_names = report_day_user_journals[-1]
+                manual_details.append(
+                    f"  报告日本人journal: 有 {latest_time} "
+                    f"({', '.join(latest_names) or '纯评论'})"
+                )
+            else:
+                manual_details.append("  报告日本人journal: 无")
+                if user_journals:
+                    recent = user_journals[-3:][::-1]
+                    manual_details.append(
+                        "  最近本人journal: " + ", ".join(
+                            f"{d} {t}({','.join(n) or '评论'})"
+                            for d, t, n in recent
+                        )
+                    )
+
             try:
-                tracker = getattr(detailed, "tracker", None)
-                tracker_name = getattr(tracker, "name", "") if tracker else ""
                 if support_always_new and tracker_name and "支持" in tracker_name:
                     status_override = self._get_initial_status(detailed)
                 else:
                     status_override = self._get_effective_status(
                         detailed, user_id, report_date
                     )
-                user_time = self._latest_user_journal_time(
-                    detailed, user_id, report_date
+                user_time = (
+                    report_day_user_journals[-1][1]
+                    if report_day_user_journals else ""
                 )
                 data = self._extract_issue_data(
                     detailed,
@@ -812,7 +935,7 @@ class RedmineClient:
             result_ids.add(issue_id)
             result.append(data)
             manual_added += 1
-            manual_details.append(f"#{issue_id} 已补充")
+            manual_details.append(f"  #{issue_id} 已强制补充")
 
         if extra_issue_ids:
             print(
