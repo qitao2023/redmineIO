@@ -141,20 +141,17 @@ def _related_id(resource: Any, attr: str) -> int:
 
 
 def _report_query_filters(report_date: str,
-                          today: str | None = None) -> tuple[str, str | None]:
-    """返回 (报告日查询条件, 后续更新查询条件)。
+                          today: str | None = None) -> tuple[str, list[str]]:
+    """返回 (报告日查询条件, 后续更新日期列表)。
 
     Redmine 的 updated_on 是“最后一次更新时间”。某个 Issue 在报告日
     被本人操作过、之后又被更新，它的 updated_on 会跑到后面去，单日查询
     会漏掉它。
 
-    但把整个区间合成一次查询也有问题：结果按 updated_on 倒序返回，
-    今天更新的 Issue 会把报告日的 Issue 挤出单次查询的 300 条上限，
-    反而比单日查询更少。因此拆成两次独立查询：
-
-    1. 报告日单日查询 —— 与旧版完全一致，保证报告日候选不被挤掉；
-    2. 报告日之后到今天的查询 —— 只做“补漏”，命中后仍由 journal
-       校验按报告日过滤，不会把之后别人的更新误收进日报。
+    后续更新不能合成一个区间查：那样会按 updated_on 倒序返回，
+    今天更新的 Issue 会把较早的更新挤出 300 条上限。这里拆成
+    “报告日 + 之后每一天”的单日查询；后续日按升序取，优先保留
+    每天较早的更新（例如报告次日早上被转派的记录）。
     """
     if today is None:
         today = datetime.now(_BEIJING_TZ).date().isoformat()
@@ -162,16 +159,16 @@ def _report_query_filters(report_date: str,
         report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
         today_dt = datetime.strptime(today, "%Y-%m-%d").date()
     except (TypeError, ValueError):
-        return report_date, None
+        return report_date, []
     if report_dt >= today_dt:
-        return report_date, None
+        return report_date, []
 
-    next_day = (report_dt + timedelta(days=1)).isoformat()
-    if next_day == today:
-        followup = today
-    else:
-        followup = f"><{next_day}|{today}"
-    return report_date, followup
+    followups = []
+    followup_dt = report_dt + timedelta(days=1)
+    while followup_dt <= today_dt and len(followups) < 31:
+        followups.append(followup_dt.isoformat())
+        followup_dt += timedelta(days=1)
+    return report_date, followups
 
 
 class RedmineClientError(Exception):
@@ -502,48 +499,32 @@ class RedmineClient:
                     pass
 
         page_size = max(1, min(int(limit or _PAGE_SIZE), _PAGE_SIZE))
-        primary_filter, followup_filter = _report_query_filters(report_date)
-        query_filters = [primary_filter]
-        if followup_filter:
-            query_filters.append(followup_filter)
-        historical = followup_filter is not None
-
-        # “曾经指派给本人”的日期列表。某些 Issue 本人在报告日处理过
-        # （例如把指派从自己转给别人），之后 updated_on 跑到后面去了；
-        # 普通的 assigned_to_id 当前指派查询找不到它。按天用 ever 过滤
-        # 查一遍，专门补这类临时经办/转派记录。
-        ev_dates = [report_date]
-        if historical:
-            try:
-                today_dt = datetime.now(_BEIJING_TZ).date()
-                ev_dt = datetime.strptime(
-                    report_date, "%Y-%m-%d"
-                ).date() + timedelta(days=1)
-                while ev_dt <= today_dt and len(ev_dates) < 32:
-                    ev_dates.append(ev_dt.isoformat())
-                    ev_dt += timedelta(days=1)
-            except (TypeError, ValueError):
-                ev_dates = [report_date]
+        primary_filter, followup_filters = _report_query_filters(report_date)
+        query_filters = [primary_filter] + followup_filters
+        historical = bool(followup_filters)
 
         def _query_date(updated_on_filter: str,
                         apply_project_filter: bool = False,
+                        sort_order: str = "updated_on:desc",
+                        max_results: int = _MAX_RESULTS_PER_QUERY,
                         **extra_filters):
             """分页查询 Issue，遇到不满一页立即停止。
 
-            updated_on_filter 既可以是单日 YYYY-MM-DD，也可以是
-            Redmine 区间写法 ><from|to（历史日报使用）。
+            updated_on_filter 是单日 YYYY-MM-DD。
+            sort_order 用于后续日期升序取，优先保留较早更新。
             apply_project_filter=True 时只保留选中项目（用于全站
             author/assigned 安全网查询），避免把未勾选项目带进来。
             """
             nonlocal query_failures
             try:
                 offset = 0
-                while offset < _MAX_RESULTS_PER_QUERY:
+                while offset < max_results:
+                    current_limit = min(page_size, max_results - offset)
                     result_set = self._api().issue.filter(
                         updated_on=updated_on_filter,
                         status_id="*",
-                        sort="updated_on:desc",
-                        limit=page_size,
+                        sort=sort_order,
+                        limit=current_limit,
                         offset=offset,
                         **extra_filters,
                     )
@@ -566,7 +547,7 @@ class RedmineClient:
                         total = None
                     if total is not None and offset >= int(total):
                         break
-                    if len(page) < page_size:
+                    if len(page) < current_limit:
                         break
             except Exception as e:
                 with seen_lock:
@@ -582,6 +563,15 @@ class RedmineClient:
         with ThreadPoolExecutor(max_workers=_FILTER_WORKERS) as executor:
             futures = []
             for updated_filter in query_filters:
+                # 报告日按最新优先；后续日期按最早优先，避免同一天
+                # 晚些的更新把早上转派/处理的记录挤出 300 条上限。
+                sort_order = (
+                    "updated_on:asc"
+                    if updated_filter != report_date
+                    else "updated_on:desc"
+                )
+                is_followup = updated_filter != report_date
+                max_results = 100 if is_followup else _MAX_RESULTS_PER_QUERY
                 if project_ids:
                     if skip_review:
                         # 只查本人：仍按项目查询，保留 Redmine 对子项目的
@@ -589,10 +579,14 @@ class RedmineClient:
                         for pid in project_ids:
                             futures.append(executor.submit(
                                 _query_date, updated_filter, False,
+                                sort_order=sort_order,
+                                max_results=max_results,
                                 author_id=user_id, project_id=pid,
                             ))
                             futures.append(executor.submit(
                                 _query_date, updated_filter, False,
+                                sort_order=sort_order,
+                                max_results=max_results,
                                 assigned_to_id=user_id, project_id=pid,
                             ))
                     else:
@@ -601,40 +595,42 @@ class RedmineClient:
                         # author/assigned/全部 各查一遍（原来 3N 次，现在 N+2 次）。
                         futures.append(executor.submit(
                             _query_date, updated_filter, True,
+                            sort_order=sort_order,
+                            max_results=max_results,
                             author_id=user_id,
                         ))
                         futures.append(executor.submit(
                             _query_date, updated_filter, True,
+                            sort_order=sort_order,
+                            max_results=max_results,
                             assigned_to_id=user_id,
                         ))
                         for pid in project_ids:
                             futures.append(executor.submit(
                                 _query_date, updated_filter, False,
+                                sort_order=sort_order,
+                                max_results=max_results,
                                 project_id=pid,
                             ))
                 else:
                     # 未配置项目：全站查询
                     futures.append(executor.submit(
-                        _query_date, updated_filter, False, author_id=user_id
+                        _query_date, updated_filter, False,
+                        sort_order=sort_order, max_results=max_results,
+                        author_id=user_id,
                     ))
                     futures.append(executor.submit(
                         _query_date, updated_filter, False,
+                        sort_order=sort_order,
+                        max_results=max_results,
                         assigned_to_id=user_id,
                     ))
-                    futures.append(executor.submit(_query_date, updated_filter))
+                    futures.append(executor.submit(
+                        _query_date, updated_filter,
+                        sort_order=sort_order,
+                        max_results=max_results,
+                    ))
 
-            # 临时经办/转派历史：assigned_to_id 的 ev（曾经指派）过滤。
-            # 110203 就是报告日 20:35 由本人从 7 转给 14、10-16 又被
-            # 别人更新，普通 updated_on/当前指派查询都会漏掉。
-            for ev_date in ev_dates:
-                futures.append(executor.submit(
-                    _query_date, ev_date, bool(project_id_set),
-                    **{
-                        "f[]": ["assigned_to_id"],
-                        "op[assigned_to_id]": "ev",
-                        "v[assigned_to_id][]": [str(user_id)],
-                    },
-                ))
             for future in as_completed(futures):
                 try:
                     future.result()
