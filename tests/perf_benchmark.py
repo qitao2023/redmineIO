@@ -298,10 +298,11 @@ def build_fixture() -> tuple[list[dict], dict[int, list[dict]]]:
 class MockRedmine:
     def __init__(self, delay: float = 0.04, search_delay: float = 0.0,
                  search_ids: list[int] | None = None, spam: int = 0,
-                 own_spam: int = 0):
+                 own_spam: int = 0, legacy_updated_by: bool = False):
         self.delay = delay
         self.search_delay = search_delay
         self.search_ids = search_ids or []
+        self.legacy_updated_by = legacy_updated_by
         self.issues, self.journals = build_fixture()
         for i in range(spam):
             iid = 2000 + i
@@ -431,6 +432,12 @@ class MockRedmine:
                         ev_values = qs.get("v[assigned_to_id][]", [])
                         if ev_values:
                             ev_user = int(ev_values[-1])
+                    updated_by_user = None
+                    if params.get("updated_by"):
+                        try:
+                            updated_by_user = int(params["updated_by"])
+                        except (TypeError, ValueError):
+                            pass
                     selected = []
                     for issue in mock.issues:
                         updated_filter = params.get("updated_on")
@@ -473,6 +480,18 @@ class MockRedmine:
                                     if ever_assigned:
                                         break
                             if not ever_assigned:
+                                continue
+                        if updated_by_user is not None:
+                            if mock.legacy_updated_by:
+                                continue
+                            has_user_journal = any(
+                                (journal.get("user") or {}).get("id")
+                                == updated_by_user
+                                for journal in mock.journals.get(
+                                    issue["id"], []
+                                )
+                            )
+                            if not has_user_journal:
                                 continue
                         selected.append(issue)
 
@@ -570,7 +589,8 @@ def run(package_root: str, runs: int = 2,
         search_delay: float = 0.0,
         search_ids: list[int] | None = None,
         spam: int = 0,
-        own_spam: int = 0) -> dict:
+        own_spam: int = 0,
+        legacy_updated_by: bool = False) -> dict:
     sys.path.insert(0, str(Path(package_root).resolve()))
     from redmine_report.client import RedmineClient
     from redmine_report.generator import generate_report
@@ -578,6 +598,7 @@ def run(package_root: str, runs: int = 2,
     mock = MockRedmine(
         delay=delay, search_delay=search_delay, search_ids=search_ids,
         spam=spam, own_spam=own_spam,
+        legacy_updated_by=legacy_updated_by,
     ).start()
     try:
         client = RedmineClient(url=mock.url, api_key="test-key")
@@ -621,6 +642,7 @@ def run(package_root: str, runs: int = 2,
                 "search_ids": search_ids,
                 "spam": spam,
                 "own_spam": own_spam,
+                "legacy_updated_by": legacy_updated_by,
             },
             "timings": timings,
             "runs": reports,
@@ -723,6 +745,8 @@ def main() -> int:
                         help="add N unrelated review candidates")
     parser.add_argument("--own-spam", type=int, default=0,
                         help="add N issues owned by alice with today's journal")
+    parser.add_argument("--legacy-updated-by", action="store_true",
+                        help="simulate a server without updated_by filter")
     args = parser.parse_args()
 
     project_ids = None if args.projects.lower() == "none" else [
@@ -742,6 +766,7 @@ def main() -> int:
         search_ids=search_ids,
         spam=args.spam,
         own_spam=args.own_spam,
+        legacy_updated_by=args.legacy_updated_by,
     )
     if args.timeout_check:
         result["timeout"] = timeout_check(args.package_root)

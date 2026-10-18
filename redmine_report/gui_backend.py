@@ -455,6 +455,14 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
             )
         else:
             lines.append(f"查询范围:      {updated_filter}")
+        if timing.get("updated_by_mode"):
+            lines.append(
+                "查询模式:      按本人 journal（updated_by）定向查询"
+            )
+        else:
+            lines.append(
+                "查询模式:      全项目更新 + journal 校验"
+            )
         lines.append(
             f"预分类:        {timing.get('preclassify', '?')}s  "
             f"(新增{timing.get('preclassify_new', '?')} "

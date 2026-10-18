@@ -57,6 +57,12 @@ _AUTH_CACHE_TTL = 10 * 60
 _AUTH_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _AUTH_CACHE_LOCK = threading.Lock()
 
+# updated_by 过滤器能力探测缓存（按用户 journal 作者定向查询）
+_UPDATED_BY_CACHE_TTL = 60 * 60
+_UPDATED_BY_CACHE_MAX = 20
+_UPDATED_BY_CACHE: dict[tuple[str, str, int], tuple[float, bool]] = {}
+_UPDATED_BY_CACHE_LOCK = threading.Lock()
+
 # 连接池大小：与 journal 并发数匹配，避免每个线程重新建 TCP 连接
 _POOL_SIZE = 32
 
@@ -563,6 +569,9 @@ class RedmineClient:
         primary_filter, followup_filters = _report_query_filters(report_date)
         query_filters = [primary_filter] + followup_filters
         historical = bool(followup_filters)
+        updated_by_ok = False
+        if not skip_review:
+            updated_by_ok = self._updated_by_supported(user_id)
 
         def _query_date(updated_on_filter: str,
                         apply_project_filter: bool = False,
@@ -641,6 +650,26 @@ class RedmineClient:
                 )
                 is_followup = updated_filter != report_date
                 max_results = 100 if is_followup else _MAX_RESULTS_PER_QUERY
+                if updated_by_ok and not skip_review:
+                    # 定向查询：只查本人写过 journal 的 Issue，再加
+                    # 本人创建/经办的 Issue。避免全项目当天几百条候选。
+                    apply_project = bool(project_id_set)
+                    futures.append(executor.submit(
+                        _query_date, updated_filter, apply_project,
+                        sort_order=sort_order, max_results=max_results,
+                        author_id=user_id,
+                    ))
+                    futures.append(executor.submit(
+                        _query_date, updated_filter, apply_project,
+                        sort_order=sort_order, max_results=max_results,
+                        assigned_to_id=user_id,
+                    ))
+                    futures.append(executor.submit(
+                        _query_date, updated_filter, apply_project,
+                        sort_order=sort_order, max_results=max_results,
+                        updated_by=user_id,
+                    ))
+                    continue
                 if project_ids:
                     if skip_review:
                         # 只查本人：仍按项目查询，保留 Redmine 对子项目的
@@ -1198,6 +1227,7 @@ class RedmineClient:
             "filter": filter_elapsed,
             "updated_filter": " + ".join(query_filters),
             "historical": historical,
+            "updated_by_mode": updated_by_ok,
             "filter_queries": query_count,
             "filter_candidates": len(candidates),
             "candidates_detail": candidates_detail,
@@ -1262,6 +1292,39 @@ class RedmineClient:
                 continue
             return self._extract_time(created_on)
         return ""
+
+    def _updated_by_supported(self, user_id: int) -> bool:
+        """探测服务端是否支持 updated_by（按 journal 作者）过滤。
+
+        这是当天提速的关键：不用拉整个项目当天所有更新，只查本人
+        曾经写过 journal 的 Issue。探测结果缓存一小时。
+        """
+        cache_key = (self.url, self._api_key, int(user_id))
+        with _UPDATED_BY_CACHE_LOCK:
+            cached = _UPDATED_BY_CACHE.get(cache_key)
+            if cached is not None and time.time() - cached[0] <= _UPDATED_BY_CACHE_TTL:
+                return cached[1]
+
+        supported = False
+        try:
+            result_set = self._api().issue.filter(
+                updated_by=int(user_id),
+                status_id="*",
+                limit=1,
+            )
+            supported = bool(list(result_set))
+        except Exception as e:
+            logger.warning(
+                "updated_by 过滤探测失败，回退全项目查询: %s",
+                str(e)[:100],
+            )
+
+        with _UPDATED_BY_CACHE_LOCK:
+            if len(_UPDATED_BY_CACHE) >= _UPDATED_BY_CACHE_MAX:
+                oldest = next(iter(_UPDATED_BY_CACHE))
+                _UPDATED_BY_CACHE.pop(oldest, None)
+            _UPDATED_BY_CACHE[cache_key] = (time.time(), supported)
+        return supported
 
     def _check_journals_concurrent(
         self,
