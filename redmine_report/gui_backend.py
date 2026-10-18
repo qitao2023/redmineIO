@@ -446,6 +446,16 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
             f"(检查{timing.get('journal_checked', '?')}个, "
             f"确认{timing.get('journal_confirmed', '?')}个)"
         )
+        js = timing.get("journal_stats") or {}
+        if js:
+            lines.append(
+                f"  journal明细: 抓取{js.get('fetched', '?')} "
+                f"失败{js.get('failed', '?')} "
+                f"无本人{js.get('no_user', '?')} "
+                f"review过滤{js.get('review_filtered', '?')} "
+                f"异常{js.get('exceptions', '?')} "
+                f"确认{js.get('confirmed', '?')}"
+            )
         lines.append("─────────────────────────")
         lines.append(f"总耗时:        {timing.get('build_total', timing.get('total', '?'))}s")
 
@@ -484,6 +494,25 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
             lines.append(f"──────── review_strict 过滤（{len(rejected)}个）────────")
             for line in rejected[:50]:
                 lines.append(line)
+
+        no_user = js.get("no_user_debug") or []
+        if no_user:
+            lines.append("")
+            lines.append(
+                f"──────── 无本人 journal（{js.get('no_user', '?')}个，"
+                f"列出前{len(no_user)}个）────────"
+            )
+            for line in no_user:
+                lines.append(f"  {line}")
+
+        errors = js.get("errors_debug") or []
+        if errors:
+            lines.append("")
+            lines.append(
+                f"──────── journal 异常（{js.get('exceptions', '?')}个）────────"
+            )
+            for line in errors:
+                lines.append(f"  {line}")
 
         # journal 原始内容调试
         journal_debug = timing.get("journal_debug", [])

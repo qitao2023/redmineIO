@@ -99,8 +99,10 @@ def _classify(entry: IssueEntryData, current_user_id: int, report_date: str = ""
     if status != "新建" and is_mine:
         return "复测"
 
-    # 审核/复核：创建者不是本人
-    if not is_mine and status:
+    # 审核/复核：创建者不是本人。
+    # 即使状态名称解析失败（status 为空），只要 journal 已确认本人
+    # 当天操作过，也应保留这条记录，不能因为显示字段缺失而丢弃。
+    if not is_mine:
         return "审核/复核"
 
     # 兜底：不做自动归类，丢弃

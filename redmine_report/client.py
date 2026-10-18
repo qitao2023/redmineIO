@@ -732,19 +732,23 @@ class RedmineClient:
 
         result_before_journal = len(result)
         _p(f"正在验证journal（共{len(need_journal_check)}个）...", 55)
-        rejected, journal_failures = self._check_journals_concurrent(
+        rejected, journal_stats = self._check_journals_concurrent(
             need_journal_check, user_id, report_date, verified, result,
             review_strict=review_strict,
             historical=historical,
             cancel_check=cancel_check,
         )
+        journal_failures = int(journal_stats.get("failed", 0))
         t4 = time.perf_counter()
         journal_elapsed = t4 - t3
         confirmed_by_journal = len(result) - result_before_journal
         _p(f"journal验证完成，确认{confirmed_by_journal}个", 80)
         print(
             f"  [计时] 阶段3-journal验证: {journal_elapsed:.2f}s，"
-            f"检查 {len(need_journal_check)} 个 → 确认 {confirmed_by_journal} 个",
+            f"检查 {len(need_journal_check)} 个 → 确认 {confirmed_by_journal} 个"
+            f"（无本人{journal_stats.get('no_user', 0)}，"
+            f"review过滤{journal_stats.get('review_filtered', 0)}，"
+            f"失败{journal_stats.get('failed', 0)}）",
             file=sys.stderr,
         )
 
@@ -813,6 +817,7 @@ class RedmineClient:
             "journal": journal_elapsed,
             "journal_checked": len(need_journal_check),
             "journal_confirmed": confirmed_by_journal,
+            "journal_stats": journal_stats,
             "journal_rejected": (rejected or []) if review_strict else [],
             "total": round(t_total, 2),
             "journal_debug": journal_debug,
@@ -882,8 +887,14 @@ class RedmineClient:
 
         t0 = time.perf_counter()
         total_fetched = 0
-        total_failed = 0  # journal 抓取失败、被丢弃的 Issue 数
+        total_failed = 0  # 重试后仍抓取失败、被丢弃的 Issue 数
+        total_no_user = 0  # 本人当天没有 journal
+        total_review_filtered = 0  # review_strict 过滤掉的审核项
+        total_exceptions = 0  # 详情解析异常（已尝试回退）
+        total_confirmed = 0
         rejected_debug: list[str] = []  # 被 review_strict 过滤的 Issue
+        no_user_debug: list[str] = []
+        errors_debug: list[str] = []
         count_lock = threading.Lock()
         debug_lock = threading.Lock()
 
@@ -891,15 +902,25 @@ class RedmineClient:
             return cancel_check is not None and cancel_check()
 
         def _fetch_detailed(issue_id: int, updated_on: Any) -> tuple[Any, list] | None:
-            try:
-                detailed = self._get_detailed(issue_id, updated_on)
-                return detailed, list(getattr(detailed, "journals", []))
-            except Exception:
-                return None
+            last_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    detailed = self._get_detailed(issue_id, updated_on)
+                    return detailed, list(getattr(detailed, "journals", []))
+                except Exception as e:
+                    last_error = e
+                    if attempt == 0:
+                        time.sleep(0.3)
+            logger.warning(
+                "Issue #%s journal 抓取失败（已重试）: %s",
+                issue_id, str(last_error)[:120],
+            )
+            return None
 
         def _check_one(issue):
             """检查 journals，找用户当天最后一次改状态/指派的记录。"""
-            nonlocal total_fetched, total_failed
+            nonlocal total_fetched, total_failed, total_no_user
+            nonlocal total_review_filtered, total_exceptions
             result_item = _fetch_detailed(
                 issue.id, getattr(issue, "updated_on", None)
             )
@@ -951,10 +972,20 @@ class RedmineClient:
                     break
 
             if not found:
+                with count_lock:
+                    total_no_user += 1
+                with debug_lock:
+                    if len(no_user_debug) < 20:
+                        no_user_debug.append(
+                            f"#{issue.id} 无本人 {report_date} 的 journal"
+                        )
                 return None
 
-            # review_strict 模式：状态和指派都没变 → 跳过
-            if review_strict and not has_status_change and not has_assignee_change:
+            # review_strict 只应作用于“审核/复核”项：本人创建的复测项
+            # 即使只评论/加附件，也属于本人当天的工作，不能丢。
+            is_mine = _related_id(issue, "author") == int(user_id)
+            if (review_strict and not is_mine
+                    and not has_status_change and not has_assignee_change):
                 # 记录被过滤的原因，方便排错
                 all_names = []
                 for j in journals:
@@ -972,14 +1003,45 @@ class RedmineClient:
                         f"#{issue.id} 过滤: 无status/assignee变更 "
                         f"(details字段: {', '.join(all_names[:10]) if all_names else '空'})"
                     )
+                with count_lock:
+                    total_review_filtered += 1
                 return None
 
-            status_override = self._get_effective_status(detailed, user_id, report_date)
-            return self._extract_issue_data(
-                detailed,
-                status_override=status_override,
-                time_override=user_time if historical else None,
-            )
+            status_override = ""
+            try:
+                status_override = self._get_effective_status(
+                    detailed, user_id, report_date
+                )
+                return self._extract_issue_data(
+                    detailed,
+                    status_override=status_override,
+                    time_override=user_time if historical else None,
+                )
+            except Exception as e:
+                # 详情字段异常时不要让整条记录静默消失：回退用筛选结果
+                # 里的基础字段（状态可能取当前值），至少保留这条日报。
+                with count_lock:
+                    total_exceptions += 1
+                with debug_lock:
+                    if len(errors_debug) < 20:
+                        errors_debug.append(
+                            f"#{issue.id} journal 详情解析异常: {str(e)[:120]}"
+                        )
+                try:
+                    return self._extract_issue_data(
+                        issue,
+                        status_override=status_override,
+                        time_override=user_time if historical else None,
+                    )
+                except Exception as e2:
+                    with count_lock:
+                        total_failed += 1
+                    with debug_lock:
+                        if len(errors_debug) < 20:
+                            errors_debug.append(
+                                f"#{issue.id} 基础字段回退也失败: {str(e2)[:120]}"
+                            )
+                    return None
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_check_one, iss): iss for iss in issues}
@@ -989,20 +1051,44 @@ class RedmineClient:
                     raise CancelledError("用户取消")
                 try:
                     data = future.result()
-                except Exception:
+                except Exception as e:
+                    failed_issue = futures[future]
+                    with count_lock:
+                        total_failed += 1
+                    with debug_lock:
+                        if len(errors_debug) < 20:
+                            errors_debug.append(
+                                f"#{failed_issue.id} journal 校验异常: {str(e)[:120]}"
+                            )
                     continue
                 if data is not None and data["issue_id"] not in seen:
                     seen.add(data["issue_id"])
                     result.append(data)
+                    with count_lock:
+                        total_confirmed += 1
 
         elapsed = time.perf_counter() - t0
         avg_per = elapsed / len(issues) if issues else 0
+        journal_stats = {
+            "checked": len(issues),
+            "fetched": total_fetched,
+            "failed": total_failed,
+            "no_user": total_no_user,
+            "review_filtered": total_review_filtered,
+            "exceptions": total_exceptions,
+            "confirmed": total_confirmed,
+            "no_user_debug": no_user_debug,
+            "errors_debug": errors_debug,
+        }
         print(
             f"    [计时] journal内部: {elapsed:.2f}s（{len(issues)}个，"
-            f"成功{total_fetched}/失败{total_failed}，均{avg_per:.2f}s/个）",
+            f"抓取{total_fetched}/失败{total_failed}，"
+            f"无本人{total_no_user}，review过滤{total_review_filtered}，"
+            f"异常{total_exceptions}，确认{total_confirmed}，"
+            f"均{avg_per:.2f}s/个）",
             file=sys.stderr,
         )
-        return rejected_debug, total_failed
+        return rejected_debug, journal_stats
 
     def _extract_issue_data(self, issue: Any, status_override: str = "",
                             time_override: str | None = None) -> dict[str, Any]:
