@@ -50,12 +50,6 @@ _AUTH_CACHE_TTL = 10 * 60
 _AUTH_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _AUTH_CACHE_LOCK = threading.Lock()
 
-# 多项目过滤能力探测缓存（服务端是否支持 project_id=1|2|3）
-_MULTI_PROJECT_CACHE_TTL = 60 * 60
-_MULTI_PROJECT_CACHE_MAX = 20
-_MULTI_PROJECT_CACHE: dict[tuple[str, str, str], tuple[float, bool]] = {}
-_MULTI_PROJECT_CACHE_LOCK = threading.Lock()
-
 # 连接池大小：与 journal 并发数匹配，避免每个线程重新建 TCP 连接
 _POOL_SIZE = 32
 
@@ -503,19 +497,6 @@ class RedmineClient:
                     project_id_set.add(int(pid))
                 except (TypeError, ValueError):
                     pass
-        use_project_scope = bool(project_id_set)
-        # Redmine 的 project_id 是列表过滤器，API 里用 | 分隔多个项目。
-        # 这样一次请求就能覆盖所有勾选项目，不必每个项目各发一组查询。
-        multi_project_value = "|".join(
-            str(pid) for pid in sorted(project_id_set)
-        )
-        # 标准 Redmine 列表过滤器写法。相比 project_id=1|2|3 的快捷写法，
-        # 这个格式来自 Web UI 查询参数，旧版/定制版 Redmine 兼容性更好。
-        multi_project_params = {
-            "f[]": ["project_id"],
-            "op[project_id]": "=",
-            "v[project_id][]": [str(pid) for pid in sorted(project_id_set)],
-        }
 
         page_size = max(1, min(int(limit or _PAGE_SIZE), _PAGE_SIZE))
         primary_filter, followup_filter = _report_query_filters(report_date)
@@ -575,160 +556,42 @@ class RedmineClient:
                     updated_on_filter, str(e)[:100],
                 )
 
-        def _query_multi_all(updated_on_filter: str) -> tuple[bool, bool]:
-            """用一次多项目查询取回选中项目的全部 Issue。
-
-            返回 (supported, overflow)：
-            - supported=False：多项目过滤不可用（异常），调用方回退按项目查；
-            - overflow=True：匹配结果超过单次查询上限，回退按项目查，
-              避免今天的更新把报告日的 Issue 挤出 300 条上限。
-            """
-            try:
-                offset = 0
-                first_total: int | None = None
-                while offset < _MAX_RESULTS_PER_QUERY:
-                    result_set = self._api().issue.filter(
-                        updated_on=updated_on_filter,
-                        status_id="*",
-                        sort="updated_on:desc",
-                        limit=page_size,
-                        offset=offset,
-                        **multi_project_params,
-                    )
-                    page = list(result_set)
-                    try:
-                        total = result_set.total_count
-                    except Exception:
-                        total = None
-                    if first_total is None:
-                        first_total = total
-                        if total is not None and int(total) > _MAX_RESULTS_PER_QUERY:
-                            return True, True
-                    if not page:
-                        break
-                    for issue in page:
-                        if project_id_set:
-                            pid = _related_id(issue, "project")
-                            if pid and pid not in project_id_set:
-                                continue
-                        with seen_lock:
-                            if issue.id not in seen:
-                                seen.add(issue.id)
-                                candidates.append(issue)
-                    offset += len(page)
-                    if total is not None and offset >= int(total):
-                        break
-                    if len(page) < page_size:
-                        break
-                # 服务端没给 total_count 时，取满上限就无法判断是否还有更多，
-                # 为保证不漏记录，回退按项目查。
-                if first_total is None and offset >= _MAX_RESULTS_PER_QUERY:
-                    return True, True
-                return True, False
-            except Exception as e:
-                logger.warning(
-                    "多项目查询 updated_on=%s 不可用，回退按项目查询: %s",
-                    updated_on_filter, str(e)[:100],
-                )
-                return False, False
-
         # ═══ 阶段1: 并行 filter 查询 ═══
         t1 = time.perf_counter()
 
-        multi_ok = False
-        if use_project_scope:
-            multi_ok = self._multi_project_supported(
-                multi_project_value, project_id_set
-            )
-
         with ThreadPoolExecutor(max_workers=_FILTER_WORKERS) as executor:
-            # 多项目全量查询（每个日期一次）先并行跑：绝大多数情况下结果
-            # 远少于 300 条，一次请求就能替代 N 个项目查询。只有超限或
-            # 异常时才回退到按项目查询。
-            multi_status: dict[str, tuple[bool, bool]] = {}
-            if use_project_scope and multi_ok and not skip_review:
-                multi_futures = {
-                    executor.submit(_query_multi_all, updated_filter):
-                        updated_filter
-                    for updated_filter in query_filters
-                }
-                for future in as_completed(multi_futures):
-                    updated_filter = multi_futures[future]
-                    try:
-                        multi_status[updated_filter] = future.result()
-                    except Exception:
-                        multi_status[updated_filter] = (False, False)
-
             futures = []
             for updated_filter in query_filters:
-                if use_project_scope:
+                if project_ids:
                     if skip_review:
-                        if multi_ok:
-                            # 只查本人：多项目 author/assigned 各一次。
+                        # 只查本人：仍按项目查询，保留 Redmine 对子项目的
+                        # 原有包含行为（N 个项目 = 2N 次请求）。
+                        for pid in project_ids:
                             futures.append(executor.submit(
-                                _query_date, updated_filter, True,
-                                author_id=user_id,
-                                **multi_project_params,
+                                _query_date, updated_filter, False,
+                                author_id=user_id, project_id=pid,
                             ))
                             futures.append(executor.submit(
-                                _query_date, updated_filter, True,
-                                assigned_to_id=user_id,
-                                **multi_project_params,
+                                _query_date, updated_filter, False,
+                                assigned_to_id=user_id, project_id=pid,
                             ))
-                        else:
-                            for pid in sorted(project_id_set):
-                                futures.append(executor.submit(
-                                    _query_date, updated_filter, False,
-                                    author_id=user_id, project_id=pid,
-                                ))
-                                futures.append(executor.submit(
-                                    _query_date, updated_filter, False,
-                                    assigned_to_id=user_id, project_id=pid,
-                                ))
                     else:
-                        if multi_ok:
-                            supported, overflow = multi_status.get(
-                                updated_filter, (True, False)
-                            )
-                        else:
-                            supported, overflow = False, False
-                        if supported:
-                            # author/assigned 始终保留为安全网：即使多项目
-                            # 全量查询少返回了某个项目，本人条目也不会丢。
+                        # 本人创建/经办的全站查询作为安全网（2 次请求），
+                        # 每个项目只再查一次“当天所有更新”，不再按
+                        # author/assigned/全部 各查一遍（原来 3N 次，现在 N+2 次）。
+                        futures.append(executor.submit(
+                            _query_date, updated_filter, True,
+                            author_id=user_id,
+                        ))
+                        futures.append(executor.submit(
+                            _query_date, updated_filter, True,
+                            assigned_to_id=user_id,
+                        ))
+                        for pid in project_ids:
                             futures.append(executor.submit(
-                                _query_date, updated_filter, True,
-                                author_id=user_id,
-                                **multi_project_params,
+                                _query_date, updated_filter, False,
+                                project_id=pid,
                             ))
-                            futures.append(executor.submit(
-                                _query_date, updated_filter, True,
-                                assigned_to_id=user_id,
-                                **multi_project_params,
-                            ))
-                            if overflow:
-                                # 全量结果超过 300 条：按项目拆开，保证每个
-                                # 项目都有独立的 300 条上限。
-                                for pid in sorted(project_id_set):
-                                    futures.append(executor.submit(
-                                        _query_date, updated_filter, False,
-                                        project_id=pid,
-                                    ))
-                        elif not supported:
-                            # 多项目过滤不可用：完全回退按项目查询。
-                            for pid in sorted(project_id_set):
-                                futures.append(executor.submit(
-                                    _query_date, updated_filter, False,
-                                    author_id=user_id, project_id=pid,
-                                ))
-                                futures.append(executor.submit(
-                                    _query_date, updated_filter, False,
-                                    assigned_to_id=user_id, project_id=pid,
-                                ))
-                            for pid in sorted(project_id_set):
-                                futures.append(executor.submit(
-                                    _query_date, updated_filter, False,
-                                    project_id=pid,
-                                ))
                 else:
                     # 未配置项目：全站查询
                     futures.append(executor.submit(
@@ -747,7 +610,7 @@ class RedmineClient:
                     logger.warning("filter 查询发生未预期错误: %s", str(e)[:100])
         t2 = time.perf_counter()
         filter_elapsed = t2 - t1
-        query_count = len(futures) + len(multi_status)
+        query_count = len(futures)
         print(
             f"  [计时] 阶段1-filter查询"
             f"(updated_on={' + '.join(query_filters)}): "
@@ -997,57 +860,6 @@ class RedmineClient:
                 continue
             return self._extract_time(created_on)
         return ""
-
-    def _multi_project_supported(self, multi_value: str,
-                                 project_ids: set[int]) -> bool:
-        """探测服务端是否支持 project_id=1|2|3 的多项目过滤。
-
-        标准 Redmine 的 project_id 是列表过滤器，支持 | 分隔；但旧版或
-        定制版本可能不支持。这里用一次不带日期范围的轻量查询验证，
-        结果缓存一小时，避免每一轮都探测。
-        """
-        cache_key = (self.url, self._api_key, multi_value)
-        with _MULTI_PROJECT_CACHE_LOCK:
-            cached = _MULTI_PROJECT_CACHE.get(cache_key)
-            if cached is not None and time.time() - cached[0] <= _MULTI_PROJECT_CACHE_TTL:
-                return cached[1]
-
-        supported = False
-        try:
-            result_set = self._api().issue.filter(
-                status_id="*",
-                limit=100,
-                sort="id:asc",
-                **{
-                    "f[]": ["project_id"],
-                    "op[project_id]": "=",
-                    "v[project_id][]": [
-                        str(pid) for pid in sorted(project_ids)
-                    ],
-                },
-            )
-            page = list(result_set)
-            if page:
-                found_projects = {
-                    _related_id(issue, "project") for issue in page
-                }
-                found_projects.discard(0)
-                supported = found_projects.issubset(project_ids)
-                # 多项目过滤如果只返回了第一个项目，说明服务端没有真正
-                # 按多值过滤。此时宁可回退按项目查，也不能漏项目。
-                if len(project_ids) > 1 and len(found_projects) == 1:
-                    supported = False
-        except Exception as e:
-            logger.warning(
-                "多项目过滤探测失败，回退按项目查询: %s", str(e)[:100]
-            )
-
-        with _MULTI_PROJECT_CACHE_LOCK:
-            if len(_MULTI_PROJECT_CACHE) >= _MULTI_PROJECT_CACHE_MAX:
-                oldest = next(iter(_MULTI_PROJECT_CACHE))
-                _MULTI_PROJECT_CACHE.pop(oldest, None)
-            _MULTI_PROJECT_CACHE[cache_key] = (time.time(), supported)
-        return supported
 
     def _check_journals_concurrent(
         self,
