@@ -463,6 +463,9 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
             lines.append(
                 "查询模式:      全项目更新 + journal 校验"
             )
+        probe = timing.get("updated_by_probe")
+        if probe:
+            lines.append(f"过滤探测:      {probe}")
         lines.append(
             f"预分类:        {timing.get('preclassify', '?')}s  "
             f"(新增{timing.get('preclassify_new', '?')} "

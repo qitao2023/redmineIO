@@ -60,8 +60,9 @@ _AUTH_CACHE_LOCK = threading.Lock()
 # updated_by 过滤器能力探测缓存（按用户 journal 作者定向查询）
 _UPDATED_BY_CACHE_TTL = 60 * 60
 _UPDATED_BY_CACHE_MAX = 20
-_UPDATED_BY_CACHE: dict[tuple[str, str, int], tuple[float, bool]] = {}
+_UPDATED_BY_CACHE: dict[tuple[str, str, int], tuple[float, bool, str]] = {}
 _UPDATED_BY_CACHE_LOCK = threading.Lock()
+_UPDATED_BY_SENTINEL_USER_ID = 2147483647
 
 # 连接池大小：与 journal 并发数匹配，避免每个线程重新建 TCP 连接
 _POOL_SIZE = 32
@@ -255,6 +256,7 @@ class RedmineClient:
         # 使用独立的 Redmine 实例（各自持有连接池），请求互不干扰。
         self._thread_local = threading.local()
         self._last_timing: dict = {}
+        self._updated_by_probe_info = "未探测"
         self._status_map: dict[str, str] | None = None  # status_id → status_name
         self._status_map_lock = threading.Lock()  # 状态映射懒加载的并发保护
 
@@ -571,7 +573,13 @@ class RedmineClient:
         historical = bool(followup_filters)
         updated_by_ok = False
         if not skip_review:
-            updated_by_ok = self._updated_by_supported(user_id)
+            # 近期日期足够验证过滤器能力；不要把历史日报的 31 天
+            # 全部拿去做探测，否则会额外增加请求。
+            probe_dates = [primary_filter]
+            probe_dates.extend(followup_filters[-2:])
+            updated_by_ok = self._updated_by_supported(
+                user_id, probe_dates
+            )
 
         def _query_date(updated_on_filter: str,
                         apply_project_filter: bool = False,
@@ -1228,6 +1236,7 @@ class RedmineClient:
             "updated_filter": " + ".join(query_filters),
             "historical": historical,
             "updated_by_mode": updated_by_ok,
+            "updated_by_probe": self._updated_by_probe_info,
             "filter_queries": query_count,
             "filter_candidates": len(candidates),
             "candidates_detail": candidates_detail,
@@ -1293,37 +1302,117 @@ class RedmineClient:
             return self._extract_time(created_on)
         return ""
 
-    def _updated_by_supported(self, user_id: int) -> bool:
+    def _updated_by_supported(self, user_id: int,
+                              probe_dates: list[str]) -> bool:
         """探测服务端是否支持 updated_by（按 journal 作者）过滤。
 
         这是当天提速的关键：不用拉整个项目当天所有更新，只查本人
-        曾经写过 journal 的 Issue。探测结果缓存一小时。
+        曾经写过 journal 的 Issue。单看一次查询是否有结果并不可靠：
+        老版本 Redmine 可能直接忽略未知参数，结果看起来仍然有数据。
+        这里先用同一天的“全部更新”作为基线，再比较本人过滤后的数量；
+        如果两者相同且都有数据，再用一个不存在的用户做哨兵校验。
+        探测结果缓存一小时。
         """
-        cache_key = (self.url, self._api_key, int(user_id))
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            self._updated_by_probe_info = "用户 ID 无效"
+            return False
+
+        dates: list[str] = []
+        for value in probe_dates:
+            if value and value not in dates:
+                dates.append(value)
+        dates = dates[:3]
+        if not dates:
+            self._updated_by_probe_info = "没有可用于探测的日期"
+            return False
+
+        cache_key = (self.url, self._api_key, uid)
         with _UPDATED_BY_CACHE_LOCK:
             cached = _UPDATED_BY_CACHE.get(cache_key)
             if cached is not None and time.time() - cached[0] <= _UPDATED_BY_CACHE_TTL:
+                self._updated_by_probe_info = cached[2]
                 return cached[1]
 
         supported = False
-        try:
+        probe_info = "无近期更新样本"
+
+        def _total(result_set, page: list) -> int:
+            """读取 Redmine 返回的 total_count，缺失时退回当前页数量。"""
+            try:
+                total = result_set.total_count
+                if total is not None:
+                    return max(0, int(total))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            return len(page)
+
+        def _query_total(extra_filters: dict) -> int:
             result_set = self._api().issue.filter(
-                updated_by=int(user_id),
+                updated_on=probe_date,
+                created_on=f"<={probe_date}",
                 status_id="*",
+                sort="updated_on:desc",
                 limit=1,
+                **extra_filters,
             )
-            supported = bool(list(result_set))
-        except Exception as e:
-            logger.warning(
-                "updated_by 过滤探测失败，回退全项目查询: %s",
-                str(e)[:100],
-            )
+            page = list(result_set)
+            return _total(result_set, page)
+
+        for probe_date in dates:
+            try:
+                baseline = _query_total({})
+                if baseline <= 0:
+                    probe_info = f"{probe_date} 无更新"
+                    continue
+
+                own_total = _query_total({"updated_by": uid})
+                if own_total < baseline:
+                    supported = True
+                    probe_info = (
+                        f"{probe_date} 基线={baseline} "
+                        f"本人={own_total}"
+                    )
+                    break
+
+                # 该日期的更新恰好全部来自本人时，数量相等不能证明
+                # 过滤器生效。用不存在的用户再查一次：支持过滤时应为 0，
+                # 不支持而被忽略时仍会等于基线。
+                sentinel_total = _query_total({
+                    "updated_by": _UPDATED_BY_SENTINEL_USER_ID
+                })
+                if sentinel_total < baseline:
+                    supported = True
+                    probe_info = (
+                        f"{probe_date} 基线={baseline} "
+                        f"本人={own_total} 哨兵={sentinel_total}"
+                    )
+                    break
+                probe_info = (
+                    f"{probe_date} 基线={baseline} 本人={own_total} "
+                    f"哨兵={sentinel_total}（疑似忽略过滤）"
+                )
+                # 哨兵结果与基线相同，说明参数很可能被服务端忽略，
+                # 继续尝试其他日期是徒劳的，直接回退完整查询。
+                break
+            except Exception as e:
+                probe_info = f"{probe_date} 探测失败: {str(e)[:100]}"
+                logger.warning(
+                    "updated_by 过滤探测失败，回退全项目查询: %s",
+                    str(e)[:100],
+                )
+                break
+
+        self._updated_by_probe_info = probe_info
 
         with _UPDATED_BY_CACHE_LOCK:
             if len(_UPDATED_BY_CACHE) >= _UPDATED_BY_CACHE_MAX:
                 oldest = next(iter(_UPDATED_BY_CACHE))
                 _UPDATED_BY_CACHE.pop(oldest, None)
-            _UPDATED_BY_CACHE[cache_key] = (time.time(), supported)
+            _UPDATED_BY_CACHE[cache_key] = (
+                time.time(), supported, probe_info,
+            )
         return supported
 
     def _check_journals_concurrent(

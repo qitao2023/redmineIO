@@ -482,17 +482,20 @@ class MockRedmine:
                             if not ever_assigned:
                                 continue
                         if updated_by_user is not None:
-                            if mock.legacy_updated_by:
-                                continue
-                            has_user_journal = any(
-                                (journal.get("user") or {}).get("id")
-                                == updated_by_user
-                                for journal in mock.journals.get(
-                                    issue["id"], []
+                            # Old Redmine versions silently ignore unknown
+                            # filters.  Keep the issue instead of dropping it,
+                            # otherwise the client probe sees an empty result
+                            # and mistakes the filter for a supported one.
+                            if not mock.legacy_updated_by:
+                                has_user_journal = any(
+                                    (journal.get("user") or {}).get("id")
+                                    == updated_by_user
+                                    for journal in mock.journals.get(
+                                        issue["id"], []
+                                    )
                                 )
-                            )
-                            if not has_user_journal:
-                                continue
+                                if not has_user_journal:
+                                    continue
                         selected.append(issue)
 
                     limit = min(int(params.get("limit", 25)), 100)
@@ -623,6 +626,7 @@ def run(package_root: str, runs: int = 2,
             timings.append(round(elapsed, 3))
             reports.append({
                 "canonical": _canonical(report),
+                "timing": dict(client._last_timing),
                 "text": generate_report(
                     report,
                     custom_other="测试其他内容",
@@ -693,6 +697,32 @@ def historical_check(package_root: str) -> dict:
     ).strftime("%Y-%m-%d")
     mock = MockRedmine(delay=0.01).start()
     try:
+        # Regression cases reported in production: both issues were handled
+        # on the report date but later updated again, so a report-date-only
+        # query cannot see them.
+        regression_ids = (109300, 110203)
+        for iid, minute in zip(regression_ids, ("10", "20")):
+            issue = _issue(
+                iid,
+                1,
+                2,
+                "2026-09-10T03:00:00Z",
+                f"{REPORT_DATE}T06:{minute}:00Z",
+                "功能",
+                2,
+                assigned_to_id=1,
+            )
+            mock.issues.append(issue)
+            mock.by_id[iid] = issue
+            mock.journals[iid] = [
+                _journal(
+                    iid + 100000,
+                    1,
+                    f"{REPORT_DATE}T06:{minute}:00Z",
+                    details=[_status_detail(1, 2)],
+                )
+            ]
+
         client = RedmineClient(url=mock.url, api_key="test-key")
 
         def entry_ids():
@@ -706,7 +736,7 @@ def historical_check(package_root: str) -> dict:
 
         before = entry_ids()
         # 这三条在报告日都被本人操作过；模拟它们当天之后又被更新。
-        for iid in (105, 107, 111):
+        for iid in (105, 107, 111, *regression_ids):
             mock.by_id[iid]["updated_on"] = f"{next_day}T02:00:00Z"
         # 让历史回归测试绕过“2分钟内复用整份日报”的缓存，
         # 确保它验证的是重新查询 + journal 校验。
@@ -720,6 +750,10 @@ def historical_check(package_root: str) -> dict:
             "before": before,
             "after": after,
             "missing": sorted(set(before) - set(after)),
+            "regression_ids": list(regression_ids),
+            "regression_missing": sorted(
+                set(regression_ids) - set(after)
+            ),
         }
     finally:
         mock.stop()
@@ -792,6 +826,14 @@ def main() -> int:
             for item in result["query_log"]:
                 print(item)
         print(f"report text:\n{result['runs'][0]['text']}")
+
+    historical = result.get("historical")
+    if historical and (
+        historical.get("missing")
+        or historical.get("regression_missing")
+    ):
+        print("historical regression missing issues", file=sys.stderr)
+        return 1
     return 0
 
 
