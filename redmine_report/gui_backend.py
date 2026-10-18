@@ -6,6 +6,7 @@
 
 import json
 import os
+import re
 import sys
 import threading
 from datetime import date, datetime, timedelta
@@ -55,6 +56,20 @@ def _ok(data=None):
 
 def _err(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg}), code
+
+
+def _parse_issue_ids(raw) -> list[int]:
+    """解析用户输入的 Issue 编号：支持 #110203、逗号/空格/分号分隔。"""
+    if isinstance(raw, (list, tuple)):
+        text = " ".join(str(item) for item in raw)
+    else:
+        text = str(raw or "")
+    result: list[int] = []
+    for token in re.findall(r"\d+", text):
+        issue_id = int(token)
+        if issue_id > 0 and issue_id not in result:
+            result.append(issue_id)
+    return result[:50]
 
 
 def _get_config_dict() -> dict:
@@ -384,6 +399,7 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
                  skip_review: bool, review_strict: bool,
                  support_always_new: bool, report_with_numbers: bool,
                  show_timing: bool,
+                 extra_issue_ids: list[int] | None = None,
                  progress_callback=None,
                  cancel_check=None) -> dict:
     """在后台线程中执行日报生成。"""
@@ -395,6 +411,7 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
         skip_review=skip_review, review_strict=review_strict,
         support_always_new=support_always_new,
         debug_journals=show_timing,
+        extra_issue_ids=extra_issue_ids,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
     )
@@ -514,6 +531,13 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
             for line in errors:
                 lines.append(f"  {line}")
 
+        manual = timing.get("manual_details") or []
+        if manual:
+            lines.append("")
+            lines.append("──────── 手动补充 Issue ────────")
+            for line in manual:
+                lines.append(f"  {line}")
+
         # journal 原始内容调试
         journal_debug = timing.get("journal_debug", [])
         if journal_debug:
@@ -563,6 +587,7 @@ def _handle_generate(body: dict):
     report_date = body.get("date", "").strip()
     end_time = body.get("time", "").strip()
     project_ids = body.get("project_ids", []) or []
+    extra_issue_ids = _parse_issue_ids(body.get("extra_issues", ""))
     custom_other = body.get("custom_other", "").strip()
     skip_review = body.get("skip_review", False)
     review_strict = body.get("review_strict", True)
@@ -599,6 +624,7 @@ def _handle_generate(body: dict):
                 project_ids, custom_other,
                 skip_review, review_strict, support_always_new,
                 report_with_numbers, show_timing,
+                extra_issue_ids=extra_issue_ids,
                 progress_callback=_on_progress,
                 cancel_check=_should_cancel,
             )

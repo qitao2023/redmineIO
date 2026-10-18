@@ -495,6 +495,15 @@ html, body {
           </div>
         </div>
 
+        <div class="form-group">
+          <label class="form-label">补充 Issue 编号（可选）</label>
+          <input type="text" id="extra-issues" class="input input-mono"
+            placeholder="如 110203，多个用逗号分隔">
+          <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">
+            生成时强制拉取并补进日报，不受项目筛选、历史日期和 journal 预筛限制。
+          </div>
+        </div>
+
         <div class="btn-row">
           <button class="btn btn-primary" id="btn-generate" onclick="doGenerate(false)" style="flex:1">
             🚀 生成日报
@@ -1360,6 +1369,7 @@ async function doGenerate(showTiming) {
   const apiKey = $('#cfg-apikey').value.trim();
   const date = $('#report-date').value;
   const time = $('#report-time').value;
+  const extraIssues = $('#extra-issues').value.trim();
   const customOther = $('#custom-other').value.trim();
   const skipReview = $('#cfg-skip-review').checked;
   const reviewStrict = $('#cfg-review-strict').checked;
@@ -1384,6 +1394,7 @@ async function doGenerate(showTiming) {
     // 1) 发起异步生成
     const r = await api('POST', path, {
       url, api_key: apiKey, date, time, project_ids: projectIds,
+      extra_issues: extraIssues,
       custom_other: customOther, skip_review: skipReview,
       review_strict: reviewStrict, support_always_new: supportAlwaysNew,
       report_with_numbers: reportWithNumbers,

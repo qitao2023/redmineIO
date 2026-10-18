@@ -460,6 +460,7 @@ class RedmineClient:
         cancel_check: "callable | None" = None,
         limit: int = _PAGE_SIZE,
         debug_journals: bool = False,
+        extra_issue_ids: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         """获取指定用户在指定日期处理过的 Issues。
 
@@ -474,6 +475,8 @@ class RedmineClient:
                    最多取 _MAX_RESULTS_PER_QUERY 条）。
             debug_journals: True=输出前 3 条已确认 Issue 的 journal 原文用于调试
                             （复用已抓取的详情，通常不额外发请求）。
+            extra_issue_ids: 用户手动补充的 Issue 编号。这些 Issue 不受项目、
+                              updated_on、journal 预筛限制，直接拉取并入日报。
         """
         # project_ids 为空时：方案3 回退到原来的全站查询（不额外调用 membership API）
         def _p(msg, pct):
@@ -752,6 +755,72 @@ class RedmineClient:
             file=sys.stderr,
         )
 
+        # ═══ 阶段3.5: 用户手动补充的 Issue ═══
+        # 这些编号是用户明确要求写进日报的，不能再被项目范围、
+        # updated_on 或 journal 预筛挡住；直接按 ID 拉取并去重合并。
+        manual_details: list[str] = []
+        manual_failures = 0
+        manual_added = 0
+        result_ids = {entry["issue_id"] for entry in result}
+        for raw_id in (extra_issue_ids or []):
+            try:
+                issue_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if issue_id in result_ids:
+                manual_details.append(f"#{issue_id} 已在日报中，跳过重复添加")
+                continue
+            try:
+                detailed = self._api().issue.get(issue_id, include="journals")
+            except Exception as e:
+                manual_failures += 1
+                manual_details.append(
+                    f"#{issue_id} 补充失败: {str(e)[:120]}"
+                )
+                continue
+
+            try:
+                tracker = getattr(detailed, "tracker", None)
+                tracker_name = getattr(tracker, "name", "") if tracker else ""
+                if support_always_new and tracker_name and "支持" in tracker_name:
+                    status_override = self._get_initial_status(detailed)
+                else:
+                    status_override = self._get_effective_status(
+                        detailed, user_id, report_date
+                    )
+                user_time = self._latest_user_journal_time(
+                    detailed, user_id, report_date
+                )
+                data = self._extract_issue_data(
+                    detailed,
+                    status_override=status_override,
+                    time_override=user_time or None,
+                )
+            except Exception as e:
+                try:
+                    data = self._extract_issue_data(detailed)
+                except Exception as e2:
+                    manual_failures += 1
+                    manual_details.append(
+                        f"#{issue_id} 解析失败: {str(e2)[:120]}"
+                    )
+                    continue
+                manual_details.append(
+                    f"#{issue_id} 详情解析异常，已用基础字段补充: {str(e)[:80]}"
+                )
+
+            result_ids.add(issue_id)
+            result.append(data)
+            manual_added += 1
+            manual_details.append(f"#{issue_id} 已补充")
+
+        if extra_issue_ids:
+            print(
+                f"  [计时] 手动补充 Issue: 成功 {manual_added} 个，"
+                f"失败 {manual_failures} 个",
+                file=sys.stderr,
+            )
+
         result.sort(
             key=lambda x: (x.get("updated_on", ""), x.get("issue_id", 0)),
             reverse=True,
@@ -819,12 +888,14 @@ class RedmineClient:
             "journal_confirmed": confirmed_by_journal,
             "journal_stats": journal_stats,
             "journal_rejected": (rejected or []) if review_strict else [],
+            "manual_details": manual_details,
             "total": round(t_total, 2),
             "journal_debug": journal_debug,
             "fetch_failures": {
                 "filter": query_failures,
                 "new_detail": new_detail_failures,
                 "journal": journal_failures,
+                "manual": manual_failures,
             },
         }
         self._last_timing = timing
@@ -1168,6 +1239,7 @@ class RedmineClient:
         review_strict: bool = False,
         support_always_new: bool = False,
         debug_journals: bool = False,
+        extra_issue_ids: list[int] | None = None,
         progress_callback: "callable | None" = None,
         cancel_check: "callable | None" = None,
     ) -> DailyReport:
@@ -1180,6 +1252,7 @@ class RedmineClient:
             review_strict: True=审核复核仅计入状态/指派变更，纯评论不算。
             support_always_new: True=支持类Issue始终显示初始状态（新建）。
             debug_journals: True=额外抓取已确认 Issue 的 journal 原文用于调试。
+            extra_issue_ids: 用户手动补充的 Issue 编号，直接拉取并入日报。
             progress_callback: 进度回调 (msg, percent)。
         """
         t_build_start = time.perf_counter()
@@ -1211,6 +1284,7 @@ class RedmineClient:
                                               review_strict=review_strict,
                                               support_always_new=support_always_new,
                                               debug_journals=debug_journals,
+                                              extra_issue_ids=extra_issue_ids,
                                               progress_callback=progress_callback,
                                               cancel_check=cancel_check)
         status_thread.join(timeout=5)
@@ -1275,6 +1349,10 @@ class RedmineClient:
         if ff.get("new_detail"):
             warnings.append(
                 f"有 {ff['new_detail']} 个新增 Issue 详情抓取失败，状态可能不准确"
+            )
+        if ff.get("manual"):
+            warnings.append(
+                f"有 {ff['manual']} 个手动补充 Issue 抓取失败，请检查编号或权限"
             )
 
         return DailyReport(
