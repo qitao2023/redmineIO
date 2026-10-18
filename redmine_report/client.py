@@ -38,11 +38,6 @@ _JOURNAL_WORKERS = 32        # 阶段3: journal 抓取并发数
 _PAGE_SIZE = 100
 _MAX_RESULTS_PER_QUERY = 300
 
-# 搜索 API 只是可选的预筛步骤：绝不能让它拖慢整个日报生成。
-_SEARCH_TIMEOUT = 8
-_SEARCH_WAIT = 4.0
-_SEARCH_MIN_CANDIDATES = 25
-
 # 同一进程内复用 Issue 详情（含 journals）。key 中包含 updated_on：
 # 只要 Issue 没被修改，重复生成日报时就不需要再逐个拉 journal。
 _DETAIL_CACHE_MAX = 400
@@ -61,10 +56,6 @@ _POOL_SIZE = 32
 # 跨实例共享的状态映射缓存（GUI 每次生成都新建 RedmineClient，缓存避免重复拉取）
 _STATUS_MAP_CACHE: dict[tuple[str, str], dict[str, str]] = {}
 _STATUS_MAP_CACHE_LOCK = threading.Lock()
-
-# 复用的 requests 会话（keep-alive），供搜索 API 使用
-_SEARCH_SESSION = _requests.Session()
-
 
 class _TimeoutSession(_requests.Session):
     """给每个请求补上默认 timeout 的 Session。
@@ -147,6 +138,28 @@ def _related_id(resource: Any, attr: str) -> int:
         return int(getattr(value, "id", 0) or 0)
     except Exception:
         return 0
+
+
+def _updated_on_filter(report_date: str, today: str | None = None) -> str:
+    """构造 Redmine 的 updated_on 查询条件。
+
+    当天日报用单日条件；历史日报必须从报告日一直查到今天，因为：
+    Redmine 的 updated_on 是“最后一次更新时间”。某个 Issue 在报告日
+    被本人操作过、之后又被别人更新，它的 updated_on 已经跑到后面去了，
+    单日查询会直接漏掉它（后面的 journal 校验再准也没机会看到）。
+
+    返回单日 ``YYYY-MM-DD`` 或 Redmine 的区间写法
+    ``><YYYY-MM-DD|YYYY-MM-DD``，由 journal 校验再按报告日过滤。
+    """
+    if today is None:
+        today = datetime.now(_BEIJING_TZ).date().isoformat()
+    try:
+        datetime.strptime(report_date, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return report_date
+    if report_date < today:
+        return f"><{report_date}|{today}"
+    return report_date
 
 
 class RedmineClientError(Exception):
@@ -384,70 +397,6 @@ class RedmineClient:
                 f"获取项目列表超时或网络错误: {str(e)[:200]}"
             ) from e
 
-    def _search_user_issues(self, user_name: str, date_str: str) -> tuple[set[int], str, str]:
-        """通过 Redmine 搜索 API 快速定位用户名字出现过的 Issue。
-        返回 (issue_ids, error_msg, debug_info)。
-        """
-        q = f'user="{user_name}"'
-        url = f"{self.url}/search.json"
-        debug_parts = [f"URL: {url}?q={q}&issues=1"]
-        try:
-            resp = _SEARCH_SESSION.get(
-                url,
-                params={
-                    "q": q,
-                    "issues": 1,
-                    "titles_only": 0,
-                    "limit": 100,
-                    "offset": 0,
-                },
-                headers={
-                    "X-Redmine-API-Key": self._api_key,
-                    "Accept": "application/json",
-                },
-                timeout=_SEARCH_TIMEOUT,
-            )
-            status = resp.status_code
-            debug_parts.append(f"HTTP {status}")
-            if status != 200:
-                return set(), f"HTTP {status}", " | ".join(debug_parts)
-            data = resp.json()
-            total = data.get("total_count", 0)
-            results = data.get("results", [])
-            debug_parts.append(f"total={total}, results_count={len(results)}")
-            issue_ids: set[int] = set()
-            raw_samples: list[str] = []
-            for i, item in enumerate(results):
-                iid = None
-                item_url = item.get("url", "")
-                for part in reversed(item_url.rstrip("/").split("/")):
-                    try:
-                        iid = int(part)
-                        break
-                    except ValueError:
-                        continue
-                if iid is None:
-                    iid = item.get("id")
-                if iid is not None:
-                    try:
-                        issue_ids.add(int(iid))
-                    except (ValueError, TypeError):
-                        pass
-                if i < 5:
-                    raw_samples.append(
-                        f"#{i}: id={item.get('id')}, type={item.get('type')}, "
-                        f"title={str(item.get('title',''))[:60]}, url={item_url}"
-                    )
-            err = ""
-            if results and not issue_ids:
-                first = results[0]
-                err = f"解析不到ID, first_keys={list(first.keys())[:10]}"
-            debug_info = " | ".join(debug_parts) + "\n" + "\n".join(raw_samples)
-            logger.info("搜索 API: %s", debug_info.replace("\n", " | "))
-            return issue_ids, err, debug_info
-        except Exception as e:
-            return set(), str(e)[:100], " | ".join(debug_parts) + f" EXCEPTION: {e}"
-
     def _get_user_project_ids(self, user_id: int) -> list[int]:
         """获取用户实际参与的项目 ID 列表。
 
@@ -506,7 +455,7 @@ class RedmineClient:
             report_date: 报告日期 YYYY-MM-DD。
             user_id: 当前用户 ID。
             project_ids: 限定查询的项目 ID 列表。为 None 时自动获取用户所属项目。
-            user_name: 当前用户名（用于搜索 API 预筛）。
+            user_name: 当前用户名（保留参数兼容，当前不再用于预筛）。
             skip_review: True=跳过方案3（不查审核复核），大幅提速。
             review_strict: True=审核复核仅计入状态/指派变更，纯评论不算。
             limit: 单页查询上限（Redmine 上限 100；内部会自动翻页，
@@ -538,11 +487,16 @@ class RedmineClient:
                     pass
 
         page_size = max(1, min(int(limit or _PAGE_SIZE), _PAGE_SIZE))
+        updated_filter = _updated_on_filter(report_date)
+        historical = updated_filter != report_date
 
-        def _query_date(date_str, apply_project_filter: bool = False,
+        def _query_date(updated_on_filter: str,
+                        apply_project_filter: bool = False,
                         **extra_filters):
             """分页查询 Issue，遇到不满一页立即停止。
 
+            updated_on_filter 既可以是单日 YYYY-MM-DD，也可以是
+            Redmine 区间写法 ><from|to（历史日报使用）。
             apply_project_filter=True 时只保留选中项目（用于全站
             author/assigned 安全网查询），避免把未勾选项目带进来。
             """
@@ -551,7 +505,7 @@ class RedmineClient:
                 offset = 0
                 while offset < _MAX_RESULTS_PER_QUERY:
                     result_set = self._api().issue.filter(
-                        updated_on=date_str,
+                        updated_on=updated_on_filter,
                         status_id="*",
                         sort="updated_on:desc",
                         limit=page_size,
@@ -582,7 +536,10 @@ class RedmineClient:
             except Exception as e:
                 with seen_lock:
                     query_failures += 1
-                logger.warning("查询 %s 失败: %s", date_str, str(e)[:100])
+                logger.warning(
+                    "查询 updated_on=%s 失败: %s",
+                    updated_on_filter, str(e)[:100],
+                )
 
         # ═══ 阶段1: 并行 filter 查询 ═══
         t1 = time.perf_counter()
@@ -595,11 +552,11 @@ class RedmineClient:
                     futures = []
                     for pid in project_ids:
                         futures.append(executor.submit(
-                            _query_date, report_date, False,
+                            _query_date, updated_filter, False,
                             author_id=user_id, project_id=pid,
                         ))
                         futures.append(executor.submit(
-                            _query_date, report_date, False,
+                            _query_date, updated_filter, False,
                             assigned_to_id=user_id, project_id=pid,
                         ))
                 else:
@@ -608,28 +565,32 @@ class RedmineClient:
                     # author/assigned/全部 各查一遍（原来 3N 次，现在 N+2 次）。
                     futures = [
                         executor.submit(
-                            _query_date, report_date, True, author_id=user_id
+                            _query_date, updated_filter, True,
+                            author_id=user_id,
                         ),
                         executor.submit(
-                            _query_date, report_date, True, assigned_to_id=user_id
+                            _query_date, updated_filter, True,
+                            assigned_to_id=user_id,
                         ),
                     ]
                     for pid in project_ids:
                         futures.append(
                             executor.submit(
-                                _query_date, report_date, False, project_id=pid
+                                _query_date, updated_filter, False,
+                                project_id=pid,
                             )
                         )
             else:
                 # 未配置项目：回退原逻辑（全站查询）
                 futures = [
                     executor.submit(
-                        _query_date, report_date, False, author_id=user_id
+                        _query_date, updated_filter, False, author_id=user_id
                     ),
                     executor.submit(
-                        _query_date, report_date, False, assigned_to_id=user_id
+                        _query_date, updated_filter, False,
+                        assigned_to_id=user_id,
                     ),
-                    executor.submit(_query_date, report_date),
+                    executor.submit(_query_date, updated_filter),
                 ]
             for future in as_completed(futures):
                 try:
@@ -641,7 +602,8 @@ class RedmineClient:
         filter_elapsed = t2 - t1
         query_count = len(futures)
         print(
-            f"  [计时] 阶段1-filter查询: {filter_elapsed:.2f}s，"
+            f"  [计时] 阶段1-filter查询(updated_on={updated_filter}): "
+            f"{filter_elapsed:.2f}s，"
             f"共 {query_count} 次查询，候选 {len(candidates)} 个 Issue",
             file=sys.stderr,
         )
@@ -671,17 +633,9 @@ class RedmineClient:
             else:
                 need_journal_check.append(issue)
 
-        # 搜索 API 只是预筛：候选很少时逐个拉 journal 本来就不慢，
-        # 没必要为一个可能耗时数秒的全站搜索白等。
-        search_holder: dict[str, object] = {"issues": set(), "error": "", "debug": ""}
-        search_thread: threading.Thread | None = None
-        if (user_name and not skip_review
-                and len(need_journal_check) >= _SEARCH_MIN_CANDIDATES):
-            def _run_search():
-                search_holder["issues"], search_holder["error"], search_holder["debug"] = \
-                    self._search_user_issues(user_name, report_date)
-            search_thread = threading.Thread(target=_run_search, daemon=True)
-            search_thread.start()
+        # 搜索 API 预筛已停用：它按文本命中情况丢弃候选，会漏掉
+        # 审核/复核记录。journal 才是“本人当天是否真的操作过”的
+        # 权威判据，不能为了少几次请求而牺牲完整性。
 
         # 新增 Issue 的详情抓取是相互独立的 I/O，并行化（判定逻辑不变）。
         # "支持"类：不限状态，始终取创建时的初始状态；其他类：取当事人最后一次操作时的有效状态。
@@ -693,6 +647,7 @@ class RedmineClient:
             nonlocal new_detail_failures
             tracker_name = getattr(issue.tracker, "name", "")
             status_override = ""
+            time_override = ""
             try:
                 detailed = self._get_detailed(
                     issue.id, getattr(issue, "updated_on", None)
@@ -700,7 +655,7 @@ class RedmineClient:
             except Exception:
                 with new_detail_lock:
                     new_detail_failures += 1
-                return issue, ""
+                return issue, "", ""
             try:
                 if support_always_new and tracker_name and "支持" in tracker_name:
                     status_override = self._get_initial_status(detailed)
@@ -708,17 +663,31 @@ class RedmineClient:
                     status_override = self._get_effective_status(detailed, user_id, report_date)
             except Exception:
                 pass
-            return issue, status_override
+            if historical:
+                # 新增 Issue 也优先用本人报告日的最后操作时间；
+                # 没有 journal 时退回创建时间，避免被之后的更新打乱顺序。
+                time_override = self._latest_user_journal_time(
+                    detailed, user_id, report_date
+                )
+                if not time_override:
+                    time_override = self._extract_time(
+                        getattr(issue, "created_on", None)
+                    )
+            return issue, status_override, time_override
 
         if new_issues:
             with ThreadPoolExecutor(max_workers=_NEW_ISSUE_WORKERS) as executor:
                 futures = [executor.submit(_compute_new_status, iss) for iss in new_issues]
                 for future in as_completed(futures):
                     try:
-                        issue, status_override = future.result()
+                        issue, status_override, time_override = future.result()
                     except Exception:
                         continue
-                    data = self._extract_issue_data(issue, status_override=status_override)
+                    data = self._extract_issue_data(
+                        issue,
+                        status_override=status_override,
+                        time_override=time_override or None,
+                    )
                     if data["issue_id"] not in verified:
                         verified.add(data["issue_id"])
                         result.append(data)
@@ -734,41 +703,15 @@ class RedmineClient:
         if _should_cancel():
             raise CancelledError("用户取消")
 
-        # ═══ 阶段2.5: 搜索 API 预筛（与阶段2 并行，这里汇合） ═══
+        # ═══ 阶段2.5: 搜索预筛已停用（保留计时字段兼容旧界面） ═══
         t_act_start = time.perf_counter()
         search_issues: set[int] = set()
         search_error = ""
         search_debug = ""
-        if search_thread is not None:
-            # 搜索只是可选预筛，最多等 4 秒；超时就先继续，
-            # 不让一个慢搜索把整个日报卡住。
-            search_thread.join(timeout=_SEARCH_WAIT)
-            if search_thread.is_alive():
-                search_error = f"timeout>{_SEARCH_WAIT:.0f}s"
-            else:
-                search_issues = set(search_holder["issues"])
-                search_error = str(search_holder["error"])
-                search_debug = str(search_holder["debug"])
         skipped_by_search = 0
-        if search_issues:
-            filtered = []
-            for issue in need_journal_check:
-                author_id = _related_id(issue, "author")
-                assigned_id = _related_id(issue, "assigned_to")
-                # 本人创建/经办的 Issue 必须保留：搜索索引可能漏掉
-                # 它们，不能因为预筛而丢记录。
-                if (issue.id in search_issues or int(author_id) == int(user_id)
-                        or int(assigned_id) == int(user_id)):
-                    filtered.append(issue)
-                else:
-                    skipped_by_search += 1
-            if filtered or skipped_by_search > 0:
-                need_journal_check = filtered
         t_act_elapsed = time.perf_counter() - t_act_start
-        prefix = f"FAIL({search_error}) " if search_error else ""
         print(
-            f"  [计时] 搜索API预筛: {prefix}{t_act_elapsed:.2f}s，"
-            f"命中 {len(search_issues)} 个Issue，筛掉 {skipped_by_search} 个无关",
+            f"  [计时] 搜索预筛: 已停用（以 journal 为准）",
             file=sys.stderr,
         )
 
@@ -781,6 +724,7 @@ class RedmineClient:
         rejected, journal_failures = self._check_journals_concurrent(
             need_journal_check, user_id, report_date, verified, result,
             review_strict=review_strict,
+            historical=historical,
             cancel_check=cancel_check,
         )
         t4 = time.perf_counter()
@@ -842,6 +786,8 @@ class RedmineClient:
         t_total = time.perf_counter() - t_total_start
         timing = {
             "filter": filter_elapsed,
+            "updated_filter": updated_filter,
+            "historical": historical,
             "filter_queries": query_count,
             "filter_candidates": len(candidates),
             "candidates_detail": candidates_detail,
@@ -892,6 +838,18 @@ class RedmineClient:
             _detail_cache_put(key, detailed)
         return detailed
 
+    def _latest_user_journal_time(self, detailed: Any, user_id: int,
+                                  report_date: str) -> str:
+        """返回本人在报告日最后一次 journal 的 HH:MM。"""
+        for journal in reversed(list(getattr(detailed, "journals", []))):
+            if _related_id(journal, "user") != int(user_id):
+                continue
+            created_on = getattr(journal, "created_on", None)
+            if self._to_beijing_date(created_on) != report_date:
+                continue
+            return self._extract_time(created_on)
+        return ""
+
     def _check_journals_concurrent(
         self,
         issues: list,
@@ -901,6 +859,7 @@ class RedmineClient:
         result: list[dict[str, Any]],
         max_workers: int = _JOURNAL_WORKERS,
         review_strict: bool = False,
+        historical: bool = False,
         cancel_check: "callable | None" = None,
     ):
         """并发检查 Issue 的 journal。
@@ -945,6 +904,7 @@ class RedmineClient:
             has_status_change = False
             has_assignee_change = False
             found = False
+            user_time = ""
             for journal in reversed(journals):
                 try:
                     ju = getattr(journal, "user", None)
@@ -959,6 +919,9 @@ class RedmineClient:
 
                 if not found:
                     found = True
+                    user_time = self._extract_time(
+                        getattr(journal, "created_on", None)
+                    )
 
                 # 汇总所有 journal 的 status / assignee 变更
                 for d in getattr(journal, "details", []):
@@ -1001,7 +964,11 @@ class RedmineClient:
                 return None
 
             status_override = self._get_effective_status(detailed, user_id, report_date)
-            return self._extract_issue_data(detailed, status_override=status_override)
+            return self._extract_issue_data(
+                detailed,
+                status_override=status_override,
+                time_override=user_time if historical else None,
+            )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_check_one, iss): iss for iss in issues}
@@ -1026,14 +993,17 @@ class RedmineClient:
         )
         return rejected_debug, total_failed
 
-    def _extract_issue_data(self, issue: Any, status_override: str = "") -> dict[str, Any]:
+    def _extract_issue_data(self, issue: Any, status_override: str = "",
+                            time_override: str | None = None) -> dict[str, Any]:
         """从 Issue 资源提取结构化数据。
 
         status_override: 当事人在 journal 中最后设置的状态，
                          非空时替代 issue 当前状态。
+        time_override: 历史日报使用当事人在报告日的最后操作时间，
+                       避免因为 Issue 之后又被更新而打乱日报顺序。
         """
         updated = getattr(issue, "updated_on", "")
-        time_str = self._extract_time(updated)
+        time_str = time_override if time_override else self._extract_time(updated)
         status = status_override if status_override else getattr(issue.status, "name", "")
 
         return {

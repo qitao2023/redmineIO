@@ -1058,8 +1058,13 @@ class RedmineReportApp(ctk.CTk):
             lines = [
                 f"认证:          {timing.get('auth', '?')}s",
                 f"filter查询:    {timing.get('filter', '?')}s  ({timing.get('filter_queries', '?')}次请求, {timing.get('filter_candidates', '?')}个候选)",
+                (
+                    f"查询范围:      {timing.get('updated_filter', '?')}  (历史日期，已放宽到当天)"
+                    if timing.get('historical')
+                    else f"查询范围:      {timing.get('updated_filter', '?')}"
+                ),
                 f"预分类:        {timing.get('preclassify', '?')}s  (新增{timing.get('preclassify_new', '?')} + 待验证{timing.get('preclassify_pending', '?')})",
-                f"搜索API预筛:   {timing.get('search_api', '?')}s  (命中{timing.get('search_hit', '?')}个, 筛掉{timing.get('search_skipped', '?')}个无关){'  FAIL: '+timing.get('search_error','') if timing.get('search_error') else ''}",
+                "搜索API预筛:   已停用（以 journal 为准）",
                 f"journal验证:   {timing.get('journal', '?')}s  (检查{timing.get('journal_checked', '?')}个, 确认{timing.get('journal_confirmed', '?')}个)",
                 f"─────────────────────────",
                 f"总耗时:        {timing.get('build_total', timing.get('total', '?'))}s",

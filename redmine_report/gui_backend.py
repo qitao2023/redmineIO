@@ -418,18 +418,29 @@ def _do_generate(url: str, api_key: str, report_date: str, end_time: str,
             f"({timing.get('filter_queries', '?')}次请求, "
             f"{timing.get('filter_candidates', '?')}个候选)"
         )
+        updated_filter = timing.get('updated_filter', '?')
+        if timing.get('historical'):
+            lines.append(
+                f"查询范围:      {updated_filter}  "
+                f"(历史日期，已放宽到当天)"
+            )
+        else:
+            lines.append(f"查询范围:      {updated_filter}")
         lines.append(
             f"预分类:        {timing.get('preclassify', '?')}s  "
             f"(新增{timing.get('preclassify_new', '?')} "
             f"+ 待验证{timing.get('preclassify_pending', '?')})"
         )
         search_err = timing.get('search_error', '')
-        lines.append(
-            f"搜索API预筛:   {timing.get('search_api', '?')}s  "
-            f"(命中{timing.get('search_hit', '?')}个, "
-            f"筛掉{timing.get('search_skipped', '?')}个无关)"
-            f"{'  FAIL: ' + search_err if search_err else ''}"
-        )
+        if timing.get('search_hit') or timing.get('search_skipped') or search_err:
+            lines.append(
+                f"搜索API预筛:   {timing.get('search_api', '?')}s  "
+                f"(命中{timing.get('search_hit', '?')}个, "
+                f"筛掉{timing.get('search_skipped', '?')}个无关)"
+                f"{'  FAIL: ' + search_err if search_err else ''}"
+            )
+        else:
+            lines.append("搜索API预筛:   已停用（以 journal 为准）")
         lines.append(
             f"journal验证:   {timing.get('journal', '?')}s  "
             f"(检查{timing.get('journal_checked', '?')}个, "

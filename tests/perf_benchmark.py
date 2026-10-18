@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -424,10 +424,15 @@ class MockRedmine:
                 if path == "/issues.json":
                     selected = []
                     for issue in mock.issues:
-                        if params.get("updated_on") and not issue["updated_on"].startswith(
-                            params["updated_on"]
-                        ):
-                            continue
+                        updated_filter = params.get("updated_on")
+                        if updated_filter:
+                            issue_date = issue["updated_on"][:10]
+                            if updated_filter.startswith("><") and "|" in updated_filter:
+                                start, end = updated_filter[2:].split("|", 1)
+                                if not (start <= issue_date <= end):
+                                    continue
+                            elif not issue["updated_on"].startswith(updated_filter):
+                                continue
                         if params.get("project_id") and (
                             issue["project"]["id"] != int(params["project_id"])
                         ):
@@ -622,11 +627,55 @@ def timeout_check(package_root: str) -> dict:
         mock.stop()
 
 
+def historical_check(package_root: str) -> dict:
+    """Regenerate a past report after its issues were updated again.
+
+    Reproduces the reported bug: an issue that appeared in yesterday's
+    report is updated today, so its ``updated_on`` moves past the report
+    date.  The past report must still include it via the widened date range
+    and journal check.
+    """
+    sys.path.insert(0, str(Path(package_root).resolve()))
+    from redmine_report.client import RedmineClient
+
+    next_day = (
+        datetime.strptime(REPORT_DATE, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    mock = MockRedmine(delay=0.01).start()
+    try:
+        client = RedmineClient(url=mock.url, api_key="test-key")
+
+        def entry_ids():
+            report = client.build_report_data(
+                REPORT_DATE,
+                project_ids=[1, 2, 3],
+                skip_review=False,
+                review_strict=True,
+            )
+            return [e.issue_id for e in report.entries]
+
+        before = entry_ids()
+        # 这三条在报告日都被本人操作过；模拟它们当天之后又被更新。
+        for iid in (105, 107, 111):
+            mock.by_id[iid]["updated_on"] = f"{next_day}T02:00:00Z"
+        after = entry_ids()
+        return {
+            "report_date": REPORT_DATE,
+            "shifted_to": next_day,
+            "before": before,
+            "after": after,
+            "missing": sorted(set(before) - set(after)),
+        }
+    finally:
+        mock.stop()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--package-root", default=".")
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--timeout-check", action="store_true")
+    parser.add_argument("--historical-check", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--log-queries", action="store_true")
     parser.add_argument("--projects", default="1,2,3",
@@ -663,6 +712,8 @@ def main() -> int:
     )
     if args.timeout_check:
         result["timeout"] = timeout_check(args.package_root)
+    if args.historical_check:
+        result["historical"] = historical_check(args.package_root)
 
     if args.json:
         if not args.log_queries:
@@ -676,6 +727,8 @@ def main() -> int:
             print(f"run {i} issues: {run_result['canonical']['total_issues']}")
         if "timeout" in result:
             print(f"timeout check: {result['timeout']}")
+        if "historical" in result:
+            print(f"historical check: {result['historical']}")
         print(f"all requests: {result['total_requests']}")
         if args.log_queries:
             for item in result["query_log"]:
