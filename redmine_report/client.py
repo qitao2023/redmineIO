@@ -786,6 +786,40 @@ class RedmineClient:
                 return start <= date_str <= end
             return date_str == filter_str
 
+        def _journal_diag_line(journal) -> str:
+            juser = getattr(journal, "user", None)
+            jname = getattr(juser, "name", "") if juser else ""
+            jid = _related_id(journal, "user")
+            raw_time = getattr(journal, "created_on", None)
+            jdate = self._to_beijing_date(raw_time)
+            jtime = self._extract_time(raw_time)
+            notes = (getattr(journal, "notes", "") or "").replace(
+                "\n", " "
+            )[:160]
+            details = []
+            for d in getattr(journal, "details", []):
+                try:
+                    dd = dict(d) if hasattr(d, "__iter__") else {}
+                    if dd:
+                        name = dd.get("name", dd.get("property", "?"))
+                        old = dd.get("old_value", "")
+                        new = dd.get("new_value", "")
+                    else:
+                        name = (
+                            getattr(d, "name", "")
+                            or getattr(d, "property", "?")
+                        )
+                        old = getattr(d, "old_value", "")
+                        new = getattr(d, "new_value", "")
+                    details.append(f"{name} {old}→{new}")
+                except Exception:
+                    continue
+            return (
+                f"[{jdate} {jtime}] user={jname}(#{jid}) "
+                f"notes={notes or '-'} "
+                f"details={', '.join(details) or '-'}"
+            )
+
         for raw_id in (extra_issue_ids or []):
             try:
                 issue_id = int(raw_id)
@@ -815,6 +849,17 @@ class RedmineClient:
             )
             tracker = getattr(detailed, "tracker", None)
             tracker_name = getattr(tracker, "name", "") if tracker else ""
+            status_name = getattr(
+                getattr(detailed, "status", None), "name", ""
+            )
+            priority_name = getattr(
+                getattr(detailed, "priority", None), "name", ""
+            )
+            assigned_id = _related_id(detailed, "assigned_to")
+            assigned_name = getattr(
+                getattr(detailed, "assigned_to", None), "name", ""
+            )
+            subject = (getattr(detailed, "subject", "") or "")[:100]
             created = self._to_beijing_date(
                 getattr(detailed, "created_on", None)
             )
@@ -830,6 +875,22 @@ class RedmineClient:
             updated_matches = any(
                 _matches_updated(updated, f) for f in query_filters
             )
+            report_day_objs = []
+            other_objs = []
+            for journal in journals:
+                jdate = self._to_beijing_date(
+                    getattr(journal, "created_on", None)
+                )
+                if jdate == report_date:
+                    report_day_objs.append(journal)
+                else:
+                    other_objs.append(journal)
+            report_day_journal_lines = [
+                _journal_diag_line(journal) for journal in report_day_objs
+            ]
+            other_journal_lines = [
+                _journal_diag_line(journal) for journal in other_objs[-10:]
+            ]
 
             user_journals: list[tuple[str, str, list[str]]] = []
             report_day_user_journals: list[tuple[str, str, list[str]]] = []
@@ -876,10 +937,19 @@ class RedmineClient:
                     reason = "journal 校验未确认（检查抓取/解析）"
 
             manual_details.append(
-                f"#{issue_id} [{tracker_name or '?'}] "
-                f"项目={project_name}(#{project_id}) "
-                f"作者={author_name}(#{author_id}) "
-                f"创建={created} 更新={updated}"
+                f"#{issue_id} [{tracker_name or '?'}] {subject}"
+            )
+            manual_details.append(
+                f"  项目={project_name}(#{project_id}) "
+                f"状态={status_name or '?'} 优先级={priority_name or '?'}"
+            )
+            manual_details.append(
+                f"  作者={author_name}(#{author_id}) "
+                f"指派={assigned_name}(#{assigned_id})"
+            )
+            manual_details.append(
+                f"  创建={created} 更新={updated} "
+                f"| 查询范围={' + '.join(query_filters)}"
             )
             manual_details.append(
                 f"  自动判定: 候选={'是' if in_candidates else '否'} "
@@ -902,6 +972,20 @@ class RedmineClient:
                             for d, t, n in recent
                         )
                     )
+            manual_details.append(
+                f"  报告日 journal（{len(report_day_journal_lines)}条）:"
+            )
+            if report_day_journal_lines:
+                for line in report_day_journal_lines:
+                    manual_details.append(f"    {line}")
+            else:
+                manual_details.append("    （无）")
+            if other_journal_lines:
+                manual_details.append(
+                    f"  最近其他 journal（{len(other_journal_lines)}条）:"
+                )
+                for line in other_journal_lines:
+                    manual_details.append(f"    {line}")
 
             try:
                 if support_always_new and tracker_name and "支持" in tracker_name:
